@@ -38,6 +38,18 @@ pyinstaller main.spec
 
 `main.spec` builds a GUI executable named `主板项目文件浏览器` and includes the broader hidden-import list.
 
+### Release
+
+`release.py` automates publishing a GitHub Release with the packaged exe. It is Windows + `gh` CLI specific and targets the `15948707537/SeavoExplorer` repo over the `origin` remote.
+
+```bash
+py release.py v0.2.0           # tag, push, create release, upload dist/SeavoExplorer.exe
+py release.py --build v0.2.0   # run build_onefile.py first, then release
+py release.py                  # prompt for the version interactively
+```
+
+The script checks `gh` is installed and authenticated, verifies `dist/SeavoExplorer.exe` exists, warns on a dirty working tree, refuses a duplicate tag, then creates an annotated tag, pushes the current branch and tag, and runs `gh release create` with the exe attached. Each step fails loudly instead of crashing silently — the original "闪退" was `gh release create` running with no tag present. Keep `REPO`/`EXE` constants in sync if the repo or output name changes.
+
 ### Tests / lint
 
 There is currently no test suite or lint configuration in this repository. Do not invent commands for them in future edits unless those tools are added to the repo.
