@@ -1,7 +1,11 @@
 # Build artifacts
 dist/
 build/
+backup/
 *.spec.bak
+build_log.txt
+favicon.ico.bak
+SeavoExplorer.spec
 
 # PyInstaller
 __pycache__/
