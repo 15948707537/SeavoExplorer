@@ -4,16 +4,39 @@ import os
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
+
+def pause_before_exit():
+    try:
+        if sys.stdin.isatty():
+            input("\n按回车键退出...")
+    except EOFError:
+        pass
+
+
+def run_step(cmd, error_message):
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print()
+        print("========================================")
+        print(f" {error_message}")
+        print("========================================")
+        pause_before_exit()
+        sys.exit(result.returncode)
+
+
 print("========================================")
 print(" SeavoExplorer 单目录打包")
 print("========================================")
 print()
 
-subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller", "PyQt5", "PyPDF2", "openpyxl", "python-docx", "xlrd", "olefile", "Pillow", "opencv-python", "numpy"], capture_output=True)
+run_step(
+    [sys.executable, "-m", "pip", "install", "pyinstaller", "PyQt5", "PyPDF2", "openpyxl", "python-docx", "xlrd", "olefile", "Pillow", "opencv-python", "numpy"],
+    "依赖安装失败，请检查错误信息",
+)
 
 print()
 print("生成多尺寸图标...")
-subprocess.run([sys.executable, "make_ico.py"])
+run_step([sys.executable, "make_ico.py"], "图标生成失败，请检查错误信息")
 
 print()
 print("开始打包...")
@@ -66,15 +89,17 @@ cmd = [
 result = subprocess.run(cmd)
 
 print()
-if os.path.exists("dist/SeavoExplorer/SeavoExplorer.exe"):
+if result.returncode == 0 and os.path.exists("dist/SeavoExplorer/SeavoExplorer.exe"):
     print("========================================")
     print(" 打包成功！")
     print(" 输出目录: dist/SeavoExplorer/")
     print(" 分发时将整个目录打包为zip即可")
     print("========================================")
-else:
-    print("========================================")
-    print(" 打包失败，请检查错误信息")
-    print("========================================")
+    pause_before_exit()
+    sys.exit(0)
 
-input("\n按回车键退出...")
+print("========================================")
+print(" 打包失败，请检查错误信息")
+print("========================================")
+pause_before_exit()
+sys.exit(result.returncode or 1)

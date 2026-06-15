@@ -35,6 +35,13 @@ _SPLASH_PIXMAP = None
 PROJECT_FOLDER_RE = re.compile(r'^([SM])(\d{3,4})(?:_(.*))?$')
 
 
+def _get_app_dir():
+    """返回配置、日志等 sidecar 文件所在目录。"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _decode_zip_name(raw):
     """解码 zip 条目名：旧式 zip 用 cp437 存中文名，依次尝试 gbk、utf-8 还原，都失败则用原值。"""
     for enc in ('gbk', 'utf-8'):
@@ -327,11 +334,13 @@ class FolderScanThread(QThread):
 
     def _scan_directory(self, directory, dir_name, motherboard_folders, daughterboard_folders):
         """扫描单个目录，收集匹配的项目文件夹"""
-        if not os.path.exists(directory):
+        if self.isInterruptionRequested() or not os.path.exists(directory):
             return
         try:
             items = os.listdir(directory)
             for item in items:
+                if self.isInterruptionRequested():
+                    return
                 item_path = os.path.join(directory, item)
                 if os.path.isdir(item_path):
                     match = PROJECT_FOLDER_RE.match(item)
@@ -347,7 +356,8 @@ class FolderScanThread(QThread):
                     if self.include_subfolders:
                         self._scan_directory(item_path, dir_name, motherboard_folders, daughterboard_folders)
         except Exception as e:
-            self.scan_progress.emit(f"扫描目录 {directory} 时出错: {str(e)}")
+            if not self.isInterruptionRequested():
+                self.scan_progress.emit(f"扫描目录 {directory} 时出错: {str(e)}")
 
     def run(self):
         """线程运行方法"""
@@ -356,15 +366,20 @@ class FolderScanThread(QThread):
         motherboard_folders = []
         daughterboard_folders = []
         for dir_name, root_dir in root_dirs:
+            if self.isInterruptionRequested():
+                return
             self.scan_progress.emit(f"正在扫描: {root_dir}")
             self._scan_directory(root_dir, dir_name, motherboard_folders, daughterboard_folders)
+        if self.isInterruptionRequested():
+            return
         if self.sort_by_number:
             motherboard_folders.sort(key=lambda x: x[0])
             daughterboard_folders.sort(key=lambda x: x[0])
         else:
             motherboard_folders.sort(key=lambda x: (dir_order.get(x[4], 999), x[0]))
             daughterboard_folders.sort(key=lambda x: (dir_order.get(x[4], 999), x[0]))
-        self.scan_completed.emit(motherboard_folders, daughterboard_folders)
+        if not self.isInterruptionRequested():
+            self.scan_completed.emit(motherboard_folders, daughterboard_folders)
 
 
 class NewProjectDialog(QDialog):
@@ -1197,13 +1212,7 @@ class MainWindow(QMainWindow):
         
         # 确定配置文件的保存位置
         # 对于打包后的程序，使用EXE文件所在目录
-        import sys
-        if hasattr(sys, '_MEIPASS'):
-            # 打包后的程序
-            self.app_dir = os.path.dirname(os.path.abspath(sys.executable))
-        else:
-            # 开发环境
-            self.app_dir = os.path.dirname(os.path.abspath(__file__))
+        self.app_dir = _get_app_dir()
         
         # 初始化配置和注释文件路径
         self.CONFIG_FILE = os.path.join(self.app_dir, 'seavoexplorer.json')
@@ -1221,6 +1230,7 @@ class MainWindow(QMainWindow):
         self.sort_by_number = False
         self.archive_tool_path = ''
         self.pinned_folders = []
+        self.hidden_folders = []
         self.comments = self.load_comments() or {}
         self.clipboard_path = None
         self.clipboard_paths = []
@@ -1409,6 +1419,7 @@ class MainWindow(QMainWindow):
         settings_menu.addAction('项目文件夹设置', self.show_settings_dialog)
         settings_menu.addAction('快捷访问设置', self.show_quick_access_settings_dialog)
         settings_menu.addAction('7-Zip路径设置', self.show_7zip_settings_dialog)
+        settings_menu.addAction('恢复已隐藏项目', self.show_restore_hidden_projects_dialog)
         help_menu = menubar.addMenu('帮助')
         help_menu.addAction('新手向导', self.show_wizard)
         help_menu.addAction('使用帮助', self.show_help)
@@ -1426,6 +1437,8 @@ class MainWindow(QMainWindow):
             'custom_folders': []
         }
         self.quick_access_paths = self._get_default_quick_access_paths()
+        self.pinned_folders = []
+        self.hidden_folders = []
         self.wizard_shown = False
 
     def _get_default_quick_access_paths(self):
@@ -1497,6 +1510,8 @@ class MainWindow(QMainWindow):
                 self.quick_access_paths = config_data['quick_access_paths']
             if 'pinned_folders' in config_data:
                 self.pinned_folders = config_data['pinned_folders']
+            if 'hidden_folders' in config_data:
+                self.hidden_folders = config_data['hidden_folders']
             if 'wizard_shown' in config_data:
                 self.wizard_shown = config_data['wizard_shown']
         except Exception:
@@ -1551,6 +1566,7 @@ class MainWindow(QMainWindow):
                 'archive_tool_path': getattr(self, 'archive_tool_path', ''),
                 'quick_access_paths': getattr(self, 'quick_access_paths', []),
                 'pinned_folders': getattr(self, 'pinned_folders', []),
+                'hidden_folders': getattr(self, 'hidden_folders', []),
                 'wizard_shown': getattr(self, 'wizard_shown', False)
             }
             if hasattr(self, 'folder_structure'):
@@ -1966,8 +1982,11 @@ class MainWindow(QMainWindow):
         self.daughterboard_table.setRowCount(0)
         self.filtered_folders = {'主板': [], '子卡': []}
         
+        visible_motherboard_folders = [folder for folder in motherboard_folders if folder[1] not in self.hidden_folders]
+        visible_daughterboard_folders = [folder for folder in daughterboard_folders if folder[1] not in self.hidden_folders]
+
         # 填充主板表格
-        for folder in motherboard_folders:
+        for folder in visible_motherboard_folders:
             row_position = self.motherboard_table.rowCount()
             self.motherboard_table.insertRow(row_position)
             number_item = QTableWidgetItem(folder[2])
@@ -1979,7 +1998,7 @@ class MainWindow(QMainWindow):
             self.filtered_folders['主板'].append(FolderInfo(*folder))
         
         # 填充子卡表格
-        for folder in daughterboard_folders:
+        for folder in visible_daughterboard_folders:
             row_position = self.daughterboard_table.rowCount()
             self.daughterboard_table.insertRow(row_position)
             number_item = QTableWidgetItem(folder[2])
@@ -1990,11 +2009,12 @@ class MainWindow(QMainWindow):
             self.daughterboard_table.setItem(row_position, 1, comment_item)
             self.filtered_folders['子卡'].append(FolderInfo(*folder))
         
-        # 更新状态栏
-        self.statusBar().showMessage(
-            f"共找到 {len(motherboard_folders)} 个主板文件夹，{len(daughterboard_folders)} 个子卡文件夹"
-        )
-        
+        hidden_count = len(motherboard_folders) + len(daughterboard_folders) - len(visible_motherboard_folders) - len(visible_daughterboard_folders)
+        message = f"共找到 {len(visible_motherboard_folders)} 个主板文件夹，{len(visible_daughterboard_folders)} 个子卡文件夹"
+        if hidden_count:
+            message += f"，已隐藏 {hidden_count} 个项目"
+        self.statusBar().showMessage(message)
+
         if self.pinned_folders:
             self._apply_pin_order(self.motherboard_table)
             self._apply_pin_order(self.daughterboard_table)
@@ -2015,6 +2035,15 @@ class MainWindow(QMainWindow):
             show = text.lower() in number.lower() or text.lower() in comment.lower()
             self.daughterboard_table.setRowHidden(row, not show)
     
+    def _get_effective_folder_comment(self, folder_path):
+        if folder_path in self.comments:
+            return self.comments[folder_path]
+        folder_name = os.path.basename(folder_path)
+        match = PROJECT_FOLDER_RE.match(folder_name)
+        if match:
+            return match.group(3) if match.group(3) else ''
+        return ''
+
     def _show_folder_context_menu(self, table, pos):
         row = table.rowAt(pos.y())
         if row < 0:
@@ -2024,18 +2053,58 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         if folder_path in self.pinned_folders:
-            action = menu.addAction('取消置顶')
+            pin_action = menu.addAction('取消置顶')
         else:
-            action = menu.addAction('置顶')
+            pin_action = menu.addAction('置顶')
+        hide_action = menu.addAction('隐藏项目')
         action_pos = table.viewport().mapToGlobal(pos)
         chosen = menu.exec_(action_pos)
-        if chosen == action:
+        if chosen == pin_action:
             if folder_path in self.pinned_folders:
                 self.pinned_folders.remove(folder_path)
             else:
                 self.pinned_folders.append(folder_path)
             self._apply_pin_order(table)
             self.save_settings_to_file(self.settings, self.include_subfolders)
+        elif chosen == hide_action:
+            if folder_path not in self.hidden_folders:
+                self.hidden_folders.append(folder_path)
+            if folder_path in self.pinned_folders:
+                self.pinned_folders.remove(folder_path)
+            if folder_path == self.current_folder:
+                self.current_folder = None
+                self.file_model.setRootPath('')
+                self.file_tree.setRootIndex(QModelIndex())
+                self.preview_tab.clear()
+                self.metadata_tab.clear()
+                self.new_structure_btn.setEnabled(False)
+            self.save_settings_to_file(self.settings, self.include_subfolders)
+            self.load_filtered_folders()
+
+    def show_restore_hidden_projects_dialog(self):
+        """恢复已隐藏的项目"""
+        hidden_folders = [path for path in self.hidden_folders if os.path.exists(path)]
+        missing_folders = [path for path in self.hidden_folders if not os.path.exists(path)]
+        if missing_folders:
+            self.hidden_folders = hidden_folders
+            self.save_settings_to_file(self.settings, self.include_subfolders)
+
+        if not hidden_folders:
+            QMessageBox.information(self, '提示', '当前没有已隐藏项目')
+            return
+
+        labels = [f'{os.path.basename(path)}    {path}' for path in hidden_folders]
+        label, ok = QInputDialog.getItem(self, '恢复已隐藏项目', '请选择要恢复的项目：', labels, 0, False)
+        if not ok or not label:
+            return
+
+        index = labels.index(label)
+        restored_path = hidden_folders[index]
+        self.hidden_folders.remove(restored_path)
+        self.save_settings_to_file(self.settings, self.include_subfolders)
+        self.load_filtered_folders()
+        self.locate_new_folder(restored_path)
+        self.statusBar().showMessage(f"已恢复项目: {os.path.basename(restored_path)}")
 
     def _apply_pin_order(self, table):
         pinned_rows = []
@@ -2098,20 +2167,20 @@ class MainWindow(QMainWindow):
         if column == 0:  # 双击编号列：打开文件夹
             self._open_with_shell(folder_path)
         elif column == 1:  # 双击注释列：修改注释
-            # 从内部存储获取当前注释
-            current_comment = self.comments.get(folder_path, '')
-            
+            # 优先编辑当前界面显示的有效注释：JSON 覆盖值优先，否则使用文件夹名后缀
+            current_comment = self._get_effective_folder_comment(folder_path)
+            stored_comment = self.comments.get(folder_path)
+
             # 弹出对话框编辑注释
             folder_name = os.path.basename(folder_path)
             dialog = CommentEditDialog(f'编辑项目注释 - {folder_name}', current_comment, self)
             if dialog.exec_():
                 new_comment = dialog.get_comment()
-                # 如果注释有变化，更新内部存储
-                if new_comment != current_comment:
+                if new_comment != stored_comment:
                     if new_comment:
                         self.comments[folder_path] = new_comment
                     else:
-                        # 如果注释为空，从存储中删除
+                        # 如果注释为空，从存储中删除，界面会回退显示文件夹名后缀注释
                         self.comments.pop(folder_path, None)
                     # 保存注释
                     self.save_comments()
@@ -2296,7 +2365,20 @@ class MainWindow(QMainWindow):
             
             os.rename(file_path, new_path)
             self.statusBar().showMessage(f"已重命名: {old_name} -> {new_name}")
-            
+
+            settings_changed = False
+            if file_path in self.comments:
+                self.comments[new_path] = self.comments.pop(file_path)
+                self.save_comments()
+            if file_path in self.pinned_folders:
+                self.pinned_folders = [new_path if path == file_path else path for path in self.pinned_folders]
+                settings_changed = True
+            if file_path in self.hidden_folders:
+                self.hidden_folders = [new_path if path == file_path else path for path in self.hidden_folders]
+                settings_changed = True
+            if settings_changed:
+                self.save_settings_to_file(self.settings, self.include_subfolders)
+
             # 如果重命名的是当前项目文件夹，更新current_folder
             if file_path == self.current_folder:
                 self.current_folder = new_path
@@ -2574,17 +2656,14 @@ class MainWindow(QMainWindow):
             self._open_with_shell(file_path)
     
     def new_project(self):
-        # 获取默认新建项目文件夹
-        # 1. 如果有项目文件路径，使用第一条的路径
-        if hasattr(self, 'settings') and self.settings is not None and self.settings:
-            # 默认使用项目文件路径的第一条的路径部分
-            default_folder = self.settings[0][1]
-        # 2. 否则使用用户主文件夹
-        elif hasattr(self, 'default_new_project_folder') and self.default_new_project_folder:
+        # 获取默认新建项目文件夹：优先使用用户上次选择的目录，再回退到第一条项目根目录
+        if hasattr(self, 'default_new_project_folder') and self.default_new_project_folder and os.path.isdir(self.default_new_project_folder):
             default_folder = self.default_new_project_folder
+        elif hasattr(self, 'settings') and self.settings is not None and self.settings:
+            default_folder = self.settings[0][1]
         else:
             default_folder = os.path.expanduser("~")
-            
+
         dialog = NewProjectDialog(self, default_folder=default_folder)
         if dialog.exec_():
             project_info = dialog.get_project_info()
@@ -2979,31 +3058,42 @@ class MainWindow(QMainWindow):
         help_text.setHtml('''
 <h2 style="color: #2c3e50;">SeavoExplorer 使用帮助</h2>
 <p style="color: #7f8c8d;">主板/子卡项目文件浏览器 —— 快速定位项目、预览工程文档、整理版本目录。
-首次使用建议先看 <b>帮助 → 新手向导</b>。</p>
+首次使用建议先看 <b>帮助 → 新手向导</b>，再按本页完成路径、预览和压缩相关设置。</p>
 
-<h3 style="color: #2980b9;">一、项目文件夹管理</h3>
+<h3 style="color: #2980b9;">一、首次使用流程</h3>
+<ol>
+<li>打开 <b>设置 → 项目文件夹设置</b>，添加一个或多个项目根目录。</li>
+<li>按需要勾选 <b>包含子文件夹</b>、<b>按编号排序</b>，点击确定后程序会自动刷新项目列表。</li>
+<li>在左侧搜索或选择项目，右侧文件树会显示该项目内容。</li>
+<li>单击文件查看预览与元数据，双击文件则用系统默认程序打开。</li>
+<li>如需预览/解压 <code>.rar</code>、<code>.7z</code>，请在 <b>设置 → 7-Zip路径设置</b> 中确认 7z.exe 可用。</li>
+</ol>
+
+<h3 style="color: #2980b9;">二、项目文件夹管理</h3>
 <p><b>1. 配置项目根目录</b></p>
-<p>点击菜单 <b>设置 → 项目文件夹设置</b>，添加一个或多个包含项目文件夹的根目录。程序会自动扫描这些目录下符合命名规则的文件夹。</p>
+<p>点击菜单 <b>设置 → 项目文件夹设置</b>，添加包含项目文件夹的根目录。程序会扫描这些目录下符合命名规则的项目文件夹。</p>
 <p>命名规则：以 <b>S</b>（主板）或 <b>M</b>（子卡）开头，后跟 <b>3~4 位数字</b>，可选 <code>_注释</code> 后缀。例如：<code>S001</code>、<code>M1234</code>、<code>S002_样机</code>、<code>M003_说明</code>。</p>
 <ul>
-<li>勾选<b>"包含子文件夹"</b>：递归扫描子目录中的项目文件夹</li>
-<li>勾选<b>"按编号排序"</b>：忽略来源目录分组，所有项目统一按编号大小排序；不勾选时先按根目录添加顺序分组，组内再按编号排序</li>
+<li><b>包含子文件夹</b>：递归扫描根目录下面的子目录，适合项目按客户/年份分层存放的场景</li>
+<li><b>按编号排序</b>：忽略来源目录分组，所有项目统一按编号大小排序；不勾选时先按根目录添加顺序分组，组内再按编号排序</li>
+<li><b>刷新</b>：按 <b>F5</b> 或重新打开设置后确认，可重新扫描项目与文件树</li>
 </ul>
 
 <p><b>2. 项目列表操作</b></p>
 <ul>
 <li><b>单击</b>项目行：在右侧文件树中显示该项目的文件</li>
 <li><b>双击编号列</b>：在系统资源管理器中打开该项目文件夹</li>
-<li><b>双击注释列</b>：编辑项目注释（自动保存到 <code>seavo_comments.json</code>）</li>
-<li><b>右键项目行</b>：置顶 / 取消置顶。置顶项以加粗显示并排在列表前部</li>
-<li><b>文件夹搜索框</b>：输入关键词实时过滤项目列表</li>
+<li><b>双击注释列</b>：编辑项目注释，注释会自动保存到 <code>seavo_comments.json</code></li>
+<li><b>右键项目行</b>：置顶 / 取消置顶，置顶项会加粗并排在列表前部</li>
+<li><b>隐藏项目</b>：不常用或已归档项目可隐藏；如需找回，请使用 <b>设置 → 恢复已隐藏项目</b></li>
+<li><b>文件夹搜索框</b>：输入编号、注释或路径关键词实时过滤项目列表</li>
 </ul>
 <p style="color: #7f8c8d;">注释显示优先级：若 <code>seavo_comments.json</code> 中对该文件夹有注释则优先显示，否则使用文件夹名的 <code>_注释</code> 后缀。</p>
 
-<h3 style="color: #2980b9;">二、文件浏览与操作</h3>
+<h3 style="color: #2980b9;">三、文件浏览与操作</h3>
 <p><b>1. 文件浏览</b></p>
 <ul>
-<li>单击文件：在下方<b>文件预览</b>区显示内容；<b>元数据</b>标签页显示大小、创建/修改时间等详情</li>
+<li>单击文件：在下方 <b>文件预览</b> 区显示内容；<b>元数据</b> 标签页显示大小、创建/修改时间等详情</li>
 <li>双击文件：用系统默认程序打开</li>
 <li>双击文件夹：在资源管理器中打开</li>
 <li>双击空白区域：在资源管理器中打开当前项目文件夹</li>
@@ -3015,24 +3105,25 @@ class MainWindow(QMainWindow):
 <p><b>3. 右键菜单</b></p>
 <p>选中<b>单个</b>文件/文件夹时：</p>
 <ul>
-<li><b>复制</b>：复制到剪贴板，既可在资源管理器中粘贴，也可用程序内"粘贴副本"</li>
+<li><b>复制</b>：复制到剪贴板，既可在资源管理器中粘贴，也可用程序内“粘贴副本”</li>
 <li><b>粘贴副本</b>：把剪贴板中的内容复制到当前位置，自动处理重名（追加 <code>_副本N</code>）</li>
-<li><b>重命名</b>：重命名文件或文件夹（也可按 F2）</li>
-<li><b>添加到zip压缩包</b>：压缩为同名 .zip 文件</li>
-<li><b>智能解压</b>：仅对 .zip/.rar/.7z 显示</li>
-<li><b>移入回收站</b>：移入系统回收站</li>
+<li><b>重命名</b>：重命名文件或文件夹（也可按 <b>F2</b>）</li>
+<li><b>添加到zip压缩包</b>：压缩为同名 <code>.zip</code> 文件</li>
+<li><b>智能解压</b>：仅对 <code>.zip</code>、<code>.rar</code>、<code>.7z</code> 显示</li>
+<li><b>移入回收站</b>：移入系统回收站，避免直接永久删除</li>
 </ul>
 <p>选中<b>多个</b>项目时，菜单仅保留可批量执行的项：<b>复制</b>、<b>添加到zip压缩包</b>、<b>移入回收站</b>。</p>
 <p>在<b>空白处</b>右键：仅显示<b>粘贴副本</b>，粘贴到当前项目文件夹。</p>
 
 <p><b>4. 复制与粘贴的目标规则</b></p>
 <ul>
-<li>复制（单个或多个）后，"粘贴副本"会把<b>全部</b>已复制项粘到目标位置</li>
+<li>复制（单个或多个）后，“粘贴副本”会把<b>全部</b>已复制项粘到目标位置</li>
 <li>粘贴时若<b>选中了一个文件夹</b>，粘贴到该文件夹内；若选中的是文件，则粘到其所在目录</li>
 <li>若<b>选中了多个</b>项目，则粘贴到当前项目根文件夹</li>
+<li>粘贴遇到重名文件或文件夹时，会自动追加副本序号，避免覆盖原文件</li>
 </ul>
 
-<h3 style="color: #2980b9;">三、文件预览</h3>
+<h3 style="color: #2980b9;">四、文件预览</h3>
 <p>单击文件树中的文件，下方预览区会自动显示内容：</p>
 <table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">
 <tr style="background: #ecf0f1;"><th>文件类型</th><th>支持格式</th><th>说明</th></tr>
@@ -3046,19 +3137,20 @@ class MainWindow(QMainWindow):
 </table>
 <p style="color: #7f8c8d;">加密工程文件（.opj .dsn .sch .brd .dbk .dsnlck）无法预览，会显示提示信息而非二进制内容；请用对应 EDA 软件打开。</p>
 
-<h3 style="color: #2980b9;">四、压缩包操作</h3>
+<h3 style="color: #2980b9;">五、压缩包操作</h3>
 <p><b>1. 智能解压</b></p>
-<p>右键压缩包选择"智能解压"，程序自动判断：</p>
+<p>右键压缩包选择“智能解压”，程序自动判断：</p>
 <ul>
 <li>包内只有一个顶层项目 → 直接解压到当前目录</li>
-<li>包内有多个顶层项目 → 创建与压缩包同名的文件夹，解压到其中（避免文件散落）</li>
+<li>包内有多个顶层项目 → 创建与压缩包同名的文件夹，解压到其中，避免文件散落</li>
 </ul>
-<p>.zip 使用内置解压；.rar / .7z 需要 7-Zip 支持。</p>
+<p><code>.zip</code> 使用内置解压；<code>.rar</code> / <code>.7z</code> 需要 7-Zip 支持。</p>
 
 <p><b>2. 添加到 zip 压缩包</b></p>
 <ul>
-<li>选中单个项目：在同目录下生成同名 .zip（重名时自动追加序号）</li>
-<li>选中多个项目：一并打包为一个 .zip</li>
+<li>选中单个项目：在同目录下生成同名 <code>.zip</code>，重名时自动追加序号</li>
+<li>选中多个项目：一并打包为一个 <code>.zip</code></li>
+<li>压缩文件会保留原有目录层级，便于发给他人后直接解压使用</li>
 </ul>
 
 <p><b>3. 7-Zip 路径设置</b></p>
@@ -3070,22 +3162,23 @@ class MainWindow(QMainWindow):
 <li>C:\\Program Files (x86)\\7-Zip\\7z.exe</li>
 </ol>
 
-<h3 style="color: #2980b9;">五、快捷访问栏</h3>
+<h3 style="color: #2980b9;">六、快捷访问栏</h3>
 <p>菜单栏下方的快捷访问栏提供常用文件夹的快速入口：</p>
 <ul>
 <li><b>普通按钮</b>（默认样式）：点击后在文件树中显示该文件夹内容</li>
 <li><b>不显示预览按钮</b>（灰色斜体）：点击后直接在资源管理器中打开</li>
 </ul>
-<p style="color: #7f8c8d;">提示：磁盘根目录、网络文件夹等大目录建议设为"不显示预览"，避免文件树加载缓慢。</p>
 <p>菜单 <b>设置 → 快捷访问设置</b> 可添加、删除、排序快捷项，并为每项设置名称、路径和是否不显示预览。</p>
+<p style="color: #7f8c8d;">提示：磁盘根目录、网络文件夹等大目录建议设为“不显示预览”，避免文件树加载缓慢。</p>
 
-<h3 style="color: #2980b9;">六、新建项目与版本结构</h3>
+<h3 style="color: #2980b9;">七、新建项目与版本结构</h3>
 <p><b>1. 新建项目文件夹</b></p>
-<p>点击左侧<b>"新建项目文件夹"</b>，选择类型（S/M）、输入编号和保存位置，程序自动创建符合命名规则的项目文件夹。</p>
+<p>点击左侧 <b>新建项目文件夹</b>，选择类型（S/M）、输入编号和保存位置，程序自动创建符合命名规则的项目文件夹。可选注释会作为文件夹名后缀保存，便于后续识别。</p>
 <p><b>2. 新建文件夹内部结构</b></p>
-<p>选中一个项目后，点击<b>"新建文件夹内部结构"</b>，可创建版本文件夹（如 V01）及标准子文件夹（BOM、SCH、物料、评审、信号测试），也可自定义子文件夹。上次选择的模板会被记住。</p>
+<p>选中一个项目后，点击 <b>新建文件夹内部结构</b>，可创建版本文件夹（如 <code>V01</code>）及标准子文件夹（BOM、SCH、物料、评审、信号测试），也可自定义子文件夹。上次选择的模板会被记住。</p>
+<p style="color: #7f8c8d;">建议同一项目内按版本目录归档资料，例如 <code>V01</code>、<code>V02</code>，减少不同阶段文件混放。</p>
 
-<h3 style="color: #2980b9;">七、快捷键</h3>
+<h3 style="color: #2980b9;">八、快捷键</h3>
 <table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">
 <tr style="background: #ecf0f1;"><th>快捷键</th><th>功能</th></tr>
 <tr><td>F5</td><td>刷新项目列表和文件树</td></tr>
@@ -3095,11 +3188,22 @@ class MainWindow(QMainWindow):
 <tr><td>Delete</td><td>将选中的文件/文件夹移入回收站（支持多选）</td></tr>
 </table>
 
-<h3 style="color: #2980b9;">八、其他</h3>
+<h3 style="color: #2980b9;">九、配置文件与数据保存</h3>
 <ul>
-<li><b>回收站</b>：状态栏右侧的回收站按钮可快速打开系统回收站</li>
-<li><b>新手向导</b>：菜单 <b>帮助 → 新手向导</b> 随时重新查看核心功能介绍</li>
-<li><b>设置持久化</b>：所有设置（项目路径、快捷访问、7-Zip 路径、排序选项等）自动保存到配置文件，下次启动自动加载</li>
+<li><b>应用设置</b>：项目路径、排序选项、快捷访问、7-Zip 路径等保存到 <code>seavoexplorer.json</code></li>
+<li><b>项目注释</b>：手动编辑的注释保存到 <code>seavo_comments.json</code></li>
+<li><b>保存位置</b>：开发运行时保存在脚本所在目录；打包为 exe 后保存在 exe 所在目录</li>
+<li><b>隐藏属性</b>：在 Windows 下配置文件会尽量设置为隐藏，避免误删</li>
+</ul>
+
+<h3 style="color: #2980b9;">十、常见问题</h3>
+<ul>
+<li><b>找不到项目</b>：检查根目录是否添加正确、项目文件夹是否符合 S/M + 3~4 位数字规则；若项目在更深层目录，请勾选“包含子文件夹”</li>
+<li><b>列表顺序不符合预期</b>：检查是否启用了“按编号排序”；关闭后会按根目录添加顺序分组显示</li>
+<li><b>.rar / .7z 无法预览或解压</b>：安装 7-Zip，或在 <b>设置 → 7-Zip路径设置</b> 中手动指定 7z.exe</li>
+<li><b>大目录打开慢</b>：把该路径加入快捷访问并设置为“不显示预览”，或避免把磁盘根目录作为普通预览入口</li>
+<li><b>不小心删除文件</b>：程序会移入系统回收站，可点击状态栏右侧回收站按钮打开并恢复</li>
+<li><b>预览内容乱码</b>：文本预览会尝试 UTF-8 / GBK；若仍乱码，请用专业编辑器或对应软件打开原文件</li>
 </ul>
 ''')
         
@@ -3284,7 +3388,7 @@ if __name__ == '__main__':
         error_msg = "程序异常退出: {}\n\n详细信息:\n{}".format(str(e), traceback.format_exc())
         print(error_msg)
         try:
-            with open('error_details.log', 'w', encoding='utf-8') as f:
+            with open(os.path.join(_get_app_dir(), 'error_details.log'), 'w', encoding='utf-8') as f:
                 f.write(error_msg)
         except:
             pass

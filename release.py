@@ -33,13 +33,21 @@ def run(cmd, check=True, capture=False):
     return (result.stdout or "").strip() if capture else result.returncode
 
 
+def pause_before_exit():
+    try:
+        if sys.stdin.isatty():
+            input("\n按回车键退出...")
+    except EOFError:
+        pass
+
+
 def fail(msg):
     print()
     print("========================================")
     print(" 发布中止")
     print("========================================")
     print(msg)
-    input("\n按回车键退出...")
+    pause_before_exit()
     sys.exit(1)
 
 
@@ -139,7 +147,7 @@ def main():
     print(" 发布成功！")
     print(f" {url}")
     print("========================================")
-    input("\n按回车键退出...")
+    pause_before_exit()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 dist/
 build/
 backup/
+run/
 *.spec.bak
 build_log.txt
 favicon.ico.bak

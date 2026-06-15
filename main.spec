@@ -6,11 +6,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('favicon.ico', '.'), ('favicon_src.png', '.')],
-    hiddenimports=['PyQt5.QtWidgets', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtSvg', 'PyQt5.QtGui.QPixmap', 'PyQt5.QtGui.QImage', 'PyQt5.QtWidgets.QLabel', 'PyQt5.QtWidgets.QScrollArea', 'PyPDF2', 'openpyxl', 'docx', 'xlrd', 'olefile', 'rarfile', 'py7zr', 'cv2', 'numpy', 'PIL', 'subprocess', 'traceback'],
+    hiddenimports=['PyQt5.QtWidgets', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtSvg', 'PyPDF2', 'openpyxl', 'docx', 'xlrd', 'olefile', 'cv2', 'numpy', 'PIL'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['rarfile', 'py7zr', 'PyQt5.QtWebEngine', 'PyQt5.QtWebEngineWidgets', 'PyQt5.QtMultimedia', 'PyQt5.QtMultimediaWidgets', 'PyQt5.QtSql', 'PyQt5.QtBluetooth', 'PyQt5.QtNetwork', 'PyQt5.QtXml', 'PyQt5.QtTest', 'PyQt5.QtDBus', 'PyQt5.QtQml', 'PyQt5.QtQuick', 'PyQt5.QtQuickWidgets', 'matplotlib', 'scipy', 'tornado', 'notebook', 'IPython', 'jupyter'],
     noarchive=False,
     optimize=0,
 )

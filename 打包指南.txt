@@ -1,106 +1,144 @@
-# 主板项目文件浏览器 - 打包指南
+# SeavoExplorer 打包指南
+
+本文说明如何将主板项目文件浏览器打包为 Windows 可执行程序。
 
 ## 系统要求
-- Windows 10/11 操作系统
+
+- Windows 10/11
 - Python 3.8 或更高版本
-- 至少 2GB 可用内存
+- 建议至少 2GB 可用内存
+- 推荐使用普通用户终端打包；PyInstaller 不建议在管理员终端中运行
 
 ## 安装依赖
 
-1. 确保已安装 Python 3.8+，并将 Python 添加到系统环境变量
-2. 打开命令提示符或 PowerShell，导航到项目目录
-3. 安装项目依赖：
-   ```
-   pip install -r requirements.txt
-   ```
-   主要依赖包括：
-   - PyQt5：GUI框架
-   - PyPDF2：PDF文件预览
-   - openpyxl/xlrd：Excel文件预览
-   - python-docx/olefile：Word文件预览
-   - rarfile/py7zr：压缩包文件预览
-   - opencv-python/numpy：视频缩略图生成
-   - Pillow：图像处理
-4. 安装打包工具 PyInstaller：
-   ```
-   pip install pyinstaller
-   ```
+在项目目录下执行：
 
-## 执行打包
-
-在项目目录下执行以下命令，使用预配置的spec文件：
-
+```bash
+py -m pip install -r requirements.txt
 ```
+
+主要依赖：
+
+- PyQt5：GUI 框架
+- PyPDF2：PDF 预览
+- openpyxl / xlrd：Excel 预览
+- python-docx / olefile：Word 预览
+- Pillow：图片处理和图标生成
+- opencv-python / numpy：视频缩略图生成
+- PyInstaller：打包工具
+
+说明：程序对 `.rar` / `.7z` 的预览和解压依赖外部 `7z.exe`，不是通过 `rarfile` 或 `py7zr` 打包进程序。请安装 7-Zip，或将 `7z.exe` 放在 exe 同目录，也可在程序内通过“设置 → 7-Zip路径设置”指定路径。
+
+## 推荐方式：使用打包脚本
+
+### 单文件 exe
+
+```bash
+py build_onefile.py
+```
+
+输出：
+
+```text
+dist/SeavoExplorer.exe
+```
+
+这是发布给用户下载时最常用的格式。
+
+### 单目录版本
+
+```bash
+py build_onedir.py
+```
+
+输出：
+
+```text
+dist/SeavoExplorer/
+```
+
+分发时需要将整个 `dist/SeavoExplorer/` 目录打包为 zip；不要只复制其中的 exe。
+
+## 使用 PyInstaller spec
+
+也可以使用仓库中的 `main.spec`：
+
+```bash
 pyinstaller main.spec
 ```
 
-或使用完整命令：
+`main.spec` 当前输出名称为：
 
-```
-pyinstaller -F -w --hidden-import="PyQt5.QtWidgets" --hidden-import="PyQt5.QtCore" --hidden-import="PyQt5.QtGui" --hidden-import="PyQt5.QtGui.QPixmap" --hidden-import="PyQt5.QtGui.QImage" --hidden-import="PyQt5.QtWidgets.QLabel" --hidden-import="PyQt5.QtWidgets.QScrollArea" --hidden-import="PyPDF2" --hidden-import="openpyxl" --hidden-import="docx" --hidden-import="xlrd" --hidden-import="olefile" --hidden-import="rarfile" --hidden-import="py7zr" --hidden-import="cv2" --hidden-import="numpy" --hidden-import="PIL" --hidden-import="subprocess" --hidden-import="traceback" -n "主板项目文件浏览器" main.py
-```
-
-参数说明：
-- `-F`：生成单个可执行文件
-- `-w`：隐藏控制台窗口（GUI应用程序需要）
-- `--hidden-import`：指定需要包含的隐藏依赖
-- `-n`：指定生成的可执行文件名称
-
-## 查找生成的 EXE 文件
-
-打包完成后，可执行文件将位于项目目录下的 `dist` 文件夹中，文件名为 `主板项目文件浏览器.exe`
-
-## 运行程序
-
-1. 直接双击 `主板项目文件浏览器.exe` 文件即可运行
-2. 第一次运行时，程序会自动创建 `config.json` 配置文件
-
-## 注意事项
-
-1. 打包过程可能需要几分钟时间，请耐心等待
-2. 生成的 EXE 文件较大（约 50-100 MB），这是因为包含了 Python 解释器和所有依赖库
-3. 配置文件 `config.json` 会保存在与 EXE 文件相同的目录中
-4. 如果打包过程中遇到错误，请确保：
-   - 所有依赖库已正确安装
-   - Python 版本符合要求
-   - 当前用户有足够的权限创建文件和文件夹
-
-## 配置文件保存说明
-
-程序已优化配置文件路径处理，确保：
-
-- 在开发环境中：配置文件保存在项目代码目录下
-- 在打包后的 EXE 环境中：配置文件保存在 EXE 文件所在目录下
-
-这样无论在什么环境下运行，程序都能正确加载和保存用户的设置。
-
-## 手动创建配置文件
-
-如果程序无法自动创建配置文件，可以手动创建 `config.json` 文件，内容如下：
-
-```json
-{
-  "project_paths": [
-    ["Desktop", "D:\\Desktop"],
-    ["资料", "D:\\资料"]
-  ]
-}
+```text
+主板项目文件浏览器.exe
 ```
 
-## 常见问题解决方案
+注意：辅助脚本 `build_onefile.py` / `build_onedir.py` 输出名称为 `SeavoExplorer`。如果要统一名称，请先确认目标发布命名后再同步修改脚本和 spec。
 
-1. **程序启动后无响应**
-   - 检查配置文件 `config.json` 是否存在且格式正确
-   - 确保指定的项目文件夹路径存在
+## 打包内容说明
 
-2. **提示缺少 DLL 文件**
-   - 尝试重新安装 PyInstaller：`pip install --upgrade pyinstaller`
-   - 或使用管理员权限运行打包命令
+打包脚本会：
 
-3. **打包后的程序无法预览某些文件**
-   - 确保在打包前已正确安装所有依赖库
-   - 特别是 PyPDF2、openpyxl 和 python-docx
+1. 安装/确认必要依赖。
+2. 运行 `make_ico.py` 生成多尺寸 `favicon.ico`。
+3. 调用 PyInstaller 打包 `main.py`。
+4. 将 `favicon.ico` 和 `favicon_src.png` 一并加入程序资源，保证窗口、任务栏和关于页图标可用。
+5. 排除未使用的大型模块，例如 Qt WebEngine、Qt Multimedia、matplotlib、scipy、jupyter 等，以减小体积。
 
-## 技术支持
+## 配置文件位置
 
-如果遇到其他问题，请联系开发者获取技术支持。
+程序运行时会在程序所在目录旁保存配置文件：
+
+- `seavoexplorer.json`：项目路径、排序选项、快捷访问、7-Zip 路径、置顶/隐藏项目等设置。
+- `seavo_comments.json`：项目注释。
+
+开发环境中，这些文件保存在源码目录；打包后，这些文件保存在 exe 所在目录。Windows 下程序会尽量将配置文件设为隐藏。
+
+## 发布脚本
+
+如需创建 GitHub Release，可使用：
+
+```bash
+py release.py v0.2.0
+py release.py --build v0.2.0
+```
+
+`--build` 会先运行 `build_onefile.py`，然后发布 `dist/SeavoExplorer.exe`。
+
+发布脚本依赖：
+
+- GitHub CLI：`gh`
+- 已登录 GitHub：`gh auth login`
+- 当前仓库 remote 指向发布目标
+
+## 常见问题
+
+### 1. 打包失败：PermissionError / WinError 5，无法覆盖 dist/SeavoExplorer.exe
+
+通常是旧版 exe 正在运行，或被资源管理器、杀毒软件暂时占用。请关闭正在运行的 `SeavoExplorer.exe`，等待几秒后重新打包。
+
+### 2. 打包后 .rar / .7z 无法预览或解压
+
+确认 7-Zip 可用。程序查找顺序为：
+
+1. 程序设置中手动指定的路径
+2. exe 或脚本所在目录下的 `7z.exe`
+3. `C:\Program Files\7-Zip\7z.exe`
+4. `C:\Program Files (x86)\7-Zip\7z.exe`
+
+### 3. 打包后图标不清晰或关于页无图标
+
+确认 `favicon_src.png` 和 `favicon.ico` 存在，然后重新运行：
+
+```bash
+py make_ico.py
+py build_onefile.py
+```
+
+### 4. 启动后没有项目
+
+首次启动需要在“设置 → 项目文件夹设置”中添加项目根目录。程序不会硬编码扫描某个固定路径。
+
+### 5. 需要调试启动错误
+
+GUI 打包默认隐藏控制台。如果需要查看启动异常，可临时去掉 `--windowed`，或在 spec 中设置 `console=True` 后重新打包。

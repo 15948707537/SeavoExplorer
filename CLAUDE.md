@@ -13,13 +13,13 @@ The application entry point and nearly all behavior live in `main.py`.
 ### Setup
 
 ```bash
-pip install -r requirements.txt
+py -m pip install -r requirements.txt
 ```
 
 ### Run the app
 
 ```bash
-python main.py
+py main.py
 ```
 
 ### Packaging
@@ -53,6 +53,10 @@ The script checks `gh` is installed and authenticated, verifies `dist/SeavoExplo
 ### Tests / lint
 
 There is currently no test suite or lint configuration in this repository. Do not invent commands for them in future edits unless those tools are added to the repo.
+
+### Tool-use notes
+
+- When reading normal text/code files with the Read tool, omit optional PDF-only parameters such as `pages`; never pass empty optional values like `pages: ""`. Use `pages` only for PDF files and only with a valid page range such as `"1"` or `"1-5"`.
 
 ## Architecture
 
