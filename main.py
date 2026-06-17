@@ -6,6 +6,8 @@ import traceback
 import ctypes
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from collections import namedtuple
 
 # 尝试导入OpenCV用于视频缩略图生成
@@ -25,7 +27,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeView, QTextEdit,
                                 QDialog, QGridLayout, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QFormLayout,
                                 QRadioButton, QButtonGroup, QInputDialog, QSplashScreen,
-                                QToolBar, QToolButton, QSizePolicy)
+                                QToolBar, QToolButton, QSizePolicy, QProgressDialog)
 from PyQt5.QtCore import QDir, Qt, QModelIndex, QThread, pyqtSignal, QRect, QUrl, QMimeData, QTimer
 from PyQt5.QtGui import QFont, QPixmap, QImage, QIcon, QPainter, QColor, QPen, QKeySequence, QFontDatabase
 
@@ -34,6 +36,10 @@ _SPLASH_PIXMAP = None
 # 项目文件夹命名正则：S/M 前缀 + 3~4 位编号 + 可选 _注释 后缀。
 # 集中定义，扫描器与各定位/状态栏 helper 统一复用，避免命名规则调整时漏改。
 PROJECT_FOLDER_RE = re.compile(r'^([SM])(\d{3,4})(?:_(.*))?$')
+APP_VERSION = '0.2.2'
+GITHUB_REPO_URL = 'https://github.com/15948707537/SeavoExplorer/'
+GITHUB_RELEASES_URL = 'https://github.com/15948707537/SeavoExplorer/releases'
+GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/15948707537/SeavoExplorer/releases/latest'
 
 
 def _get_app_dir():
@@ -1436,6 +1442,7 @@ class MainWindow(QMainWindow):
         help_menu = menubar.addMenu('帮助')
         help_menu.addAction('新手向导', self.show_wizard)
         help_menu.addAction('使用帮助', self.show_help)
+        help_menu.addAction('检查更新', self.check_for_updates)
         help_menu.addAction('关于', self.show_about)
     
     def _init_default_settings(self):
@@ -3161,11 +3168,138 @@ class MainWindow(QMainWindow):
         else:
             return f'{size / (1024 * 1024 * 1024):.2f} GB'
     
+    def _parse_version_tuple(self, version_text):
+        """把 v0.2.1 / 0.2.1 解析为可比较的数字元组。"""
+        cleaned = str(version_text or '').strip().lstrip('vV')
+        parts = []
+        for part in cleaned.split('.'):
+            match = re.match(r'^(\d+)', part)
+            parts.append(int(match.group(1)) if match else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
+
+    def _is_newer_version(self, latest_version, current_version):
+        return self._parse_version_tuple(latest_version) > self._parse_version_tuple(current_version)
+
+    def _versioned_exe_name(self, asset_name, tag_name):
+        """生成带版本号的 exe 文件名，如 SeavoExplorer_V0p2p1.exe。"""
+        base = os.path.splitext(os.path.basename(asset_name or 'SeavoExplorer.exe'))[0] or 'SeavoExplorer'
+        version = str(tag_name or '').strip().lstrip('vV')
+        version_part = 'V' + version.replace('.', 'p') if version else 'Vunknown'
+        return f'{base}_{version_part}.exe'
+
+    def _get_download_default_dir(self):
+        downloads = os.path.join(os.path.expanduser('~'), 'Downloads')
+        if os.path.isdir(downloads):
+            return downloads
+        if getattr(self, 'app_dir', None) and os.path.isdir(self.app_dir):
+            return self.app_dir
+        return os.path.expanduser('~')
+
+    def _fetch_latest_release(self):
+        request = urllib.request.Request(
+            GITHUB_LATEST_RELEASE_API,
+            headers={
+                'Accept': 'application/vnd.github+json',
+                'User-Agent': f'SeavoExplorer/{APP_VERSION}',
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode('utf-8'))
+
+    def _pick_release_exe_asset(self, release_data):
+        assets = release_data.get('assets') or []
+        exe_assets = [asset for asset in assets if str(asset.get('name', '')).lower().endswith('.exe')]
+        if not exe_assets:
+            return None
+        for asset in exe_assets:
+            if 'seavoexplorer' in str(asset.get('name', '')).lower():
+                return asset
+        return exe_assets[0]
+
+    def _download_update_asset(self, url, save_path):
+        request = urllib.request.Request(url, headers={'User-Agent': f'SeavoExplorer/{APP_VERSION}'})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            total = int(response.headers.get('Content-Length') or 0)
+            progress = QProgressDialog('正在下载更新...', '取消', 0, total if total > 0 else 0, self)
+            progress.setWindowTitle('下载更新')
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            downloaded = 0
+            with open(save_path, 'wb') as f:
+                while True:
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        raise Exception('已取消下载')
+                    chunk = response.read(1024 * 128)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        progress.setValue(downloaded)
+                    else:
+                        progress.setLabelText(f'正在下载更新... {downloaded / 1024 / 1024:.1f} MB')
+            progress.setValue(total if total > 0 else 0)
+
+    def check_for_updates(self):
+        """检查 GitHub Releases 并可选下载最新 exe。"""
+        self.statusBar().showMessage('正在检查更新...')
+        try:
+            release_data = self._fetch_latest_release()
+            tag_name = release_data.get('tag_name') or release_data.get('name') or ''
+            latest_version = str(tag_name).lstrip('vV')
+            release_url = release_data.get('html_url') or GITHUB_RELEASES_URL
+            asset = self._pick_release_exe_asset(release_data)
+            if not tag_name:
+                QMessageBox.warning(self, '检查更新', '未能从 GitHub Release 获取版本号。')
+                return
+            if not self._is_newer_version(latest_version, APP_VERSION):
+                QMessageBox.information(self, '检查更新', f'当前已是最新版本：{APP_VERSION}\n\n{release_url}')
+                return
+            if not asset:
+                QMessageBox.information(self, '发现新版本', f'发现新版本 {tag_name}，但该 Release 未包含 exe 附件。\n\n{release_url}')
+                return
+
+            asset_name = asset.get('name') or 'SeavoExplorer.exe'
+            size_mb = (asset.get('size') or 0) / 1024 / 1024
+            msg = f'发现新版本：{tag_name}\n当前版本：{APP_VERSION}\n附件：{asset_name}'
+            if size_mb > 0:
+                msg += f'（{size_mb:.1f} MB）'
+            msg += '\n\n是否下载最新 exe？'
+            reply = QMessageBox.question(self, '发现新版本', msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply != QMessageBox.Yes:
+                return
+
+            default_name = self._versioned_exe_name(asset_name, tag_name)
+            default_path = os.path.join(self._get_download_default_dir(), default_name)
+            save_path, _ = QFileDialog.getSaveFileName(self, '保存更新文件', default_path, '可执行文件 (*.exe)')
+            if not save_path:
+                return
+            if not save_path.lower().endswith('.exe'):
+                save_path += '.exe'
+
+            self._download_update_asset(asset.get('browser_download_url'), save_path)
+            self.statusBar().showMessage(f'更新已下载: {save_path}')
+            done = QMessageBox.question(self, '下载完成', f'已下载到：\n{save_path}\n\n是否打开所在文件夹？', QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if done == QMessageBox.Yes:
+                self._open_with_shell(os.path.dirname(save_path))
+        except urllib.error.HTTPError as e:
+            QMessageBox.warning(self, '检查更新失败', f'GitHub 返回错误：HTTP {e.code}\n请稍后重试或手动访问：\n{GITHUB_RELEASES_URL}')
+        except urllib.error.URLError as e:
+            QMessageBox.warning(self, '检查更新失败', f'无法连接 GitHub：{e.reason}\n请检查网络后重试。')
+        except Exception as e:
+            QMessageBox.warning(self, '检查更新失败', str(e))
+        finally:
+            self.statusBar().clearMessage()
+
     def show_about(self):
         about_text = (
-            'SeavoExplorer - 主板项目文件浏览器\n\n'
-            '版本 0.2.1\n\n'
-            '本版本新增快捷访问右键管理、文件夹终端打开，并完善使用帮助与新手向导。'
+            '<h3>SeavoExplorer - 主板项目文件浏览器</h3>'
+            f'<p>版本 {APP_VERSION}</p>'
+            '<p>本版本新增快捷访问右键管理、文件夹终端打开，并完善使用帮助与新手向导。</p>'
+            f'<p>GitHub：<a href="{GITHUB_REPO_URL}">{GITHUB_REPO_URL}</a></p>'
         )
         # 关于页 logo 优先用高清 PNG 源（清晰放大），回退到多尺寸 ico
         png_path = self._resource_path('favicon_src.png')
@@ -3180,6 +3314,8 @@ class MainWindow(QMainWindow):
             scaled = pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             msg = QMessageBox(self)
             msg.setWindowTitle('关于')
+            msg.setTextFormat(Qt.RichText)
+            msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
             msg.setText(about_text)
             msg.setIconPixmap(scaled)
             msg.exec_()
@@ -3202,9 +3338,9 @@ class MainWindow(QMainWindow):
         
         help_text = QTextEdit()
         help_text.setReadOnly(True)
-        help_text.setHtml('''
+        help_text.setHtml(f'''
 <h2 style="color: #2c3e50;">SeavoExplorer 使用帮助</h2>
-<p style="color: #7f8c8d;">主板/子卡项目文件浏览器 —— 快速定位项目、预览工程文档、整理版本目录。当前版本：<b>0.2.1</b>。
+<p style="color: #7f8c8d;">主板/子卡项目文件浏览器 —— 快速定位项目、预览工程文档、整理版本目录。当前版本：<b>{APP_VERSION}</b>。
 首次使用建议先看 <b>帮助 → 新手向导</b>，再按本页完成路径、预览和压缩相关设置。</p>
 
 <h3 style="color: #2980b9;">一、首次使用流程</h3>
