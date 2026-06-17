@@ -124,7 +124,7 @@ def main():
     print("创建 GitHub Release 并上传 exe（约 90MB，请稍候）...")
     notes = (
         f"## {APP_NAME} {version}\n\n"
-        f"主板项目文件浏览器。\n\n"
+        f"本次更新主要优化了内置更新下载体验：后台下载更稳定，支持重试、断点续传、临时文件保护，并补充了发布页兜底入口。\n\n"
         f"### 下载\n"
         f"下方 `SeavoExplorer.exe` 为 Windows 单文件可执行程序，"
         f"下载即用，无需安装 Python 环境。"

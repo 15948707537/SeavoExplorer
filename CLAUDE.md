@@ -43,12 +43,12 @@ pyinstaller main.spec
 `release.py` automates publishing a GitHub Release with the packaged exe. It is Windows + `gh` CLI specific and targets the `15948707537/SeavoExplorer` repo over the `origin` remote.
 
 ```bash
-py release.py v0.2.0           # tag, push, create release, upload dist/SeavoExplorer.exe
-py release.py --build v0.2.0   # run build_onefile.py first, then release
+py release.py v0.2.3           # tag, push, create release, upload dist/SeavoExplorer.exe
+py release.py --build v0.2.3   # run build_onefile.py first, then release
 py release.py                  # prompt for the version interactively
 ```
 
-The script checks `gh` is installed and authenticated, verifies `dist/SeavoExplorer.exe` exists, warns on a dirty working tree, refuses a duplicate tag, then creates an annotated tag, pushes the current branch and tag, and runs `gh release create` with the exe attached. Each step fails loudly instead of crashing silently — the original "闪退" was `gh release create` running with no tag present. Keep `REPO`/`EXE` constants in sync if the repo or output name changes.
+The script checks `gh` is installed and authenticated, verifies `dist/SeavoExplorer.exe` exists, warns on a dirty working tree, refuses a duplicate tag, then creates an annotated tag, pushes the current branch and tag, and runs `gh release create` with the exe attached. Each step fails loudly instead of crashing silently — the original "闪退" was `gh release create` running with no tag present. Before publishing a new version, update `APP_VERSION`, About/help text, README/release notes, and verify the generated exe path still matches `EXE`. Keep `REPO`/`EXE` constants in sync if the repo or output name changes.
 
 ### Tests / lint
 

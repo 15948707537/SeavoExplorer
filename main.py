@@ -2,10 +2,13 @@ import sys
 import os
 import re
 import json
+import time
+import socket
 import traceback
 import ctypes
 import shutil
 import subprocess
+import http.client
 import urllib.error
 import urllib.request
 from collections import namedtuple
@@ -36,7 +39,7 @@ _SPLASH_PIXMAP = None
 # 项目文件夹命名正则：S/M 前缀 + 3~4 位编号 + 可选 _注释 后缀。
 # 集中定义，扫描器与各定位/状态栏 helper 统一复用，避免命名规则调整时漏改。
 PROJECT_FOLDER_RE = re.compile(r'^([SM])(\d{3,4})(?:_(.*))?$')
-APP_VERSION = '0.2.2'
+APP_VERSION = '0.2.3'
 GITHUB_REPO_URL = 'https://github.com/15948707537/SeavoExplorer/'
 GITHUB_RELEASES_URL = 'https://github.com/15948707537/SeavoExplorer/releases'
 GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/15948707537/SeavoExplorer/releases/latest'
@@ -325,6 +328,158 @@ class RenameDialog(QDialog):
         
     def get_new_name(self):
         return self.new_name
+
+class UpdateDownloadThread(QThread):
+    """更新文件下载线程，支持临时文件、重试与断点续传。"""
+    progress_changed = pyqtSignal(int, int, float, int, bool, int)
+    status_changed = pyqtSignal(str)
+    download_completed = pyqtSignal(str)
+    download_failed = pyqtSignal(str)
+    download_canceled = pyqtSignal(str, int)
+
+    CHUNK_SIZE = 1024 * 1024
+    DOWNLOAD_TIMEOUT = 90
+    MAX_RETRIES = 3
+
+    def __init__(self, url, save_path, expected_size=0, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.save_path = save_path
+        self.expected_size = int(expected_size or 0)
+        self.part_path = save_path + '.part'
+
+    def _make_request(self, start=0):
+        headers = {'User-Agent': f'SeavoExplorer/{APP_VERSION}'}
+        if start > 0:
+            headers['Range'] = f'bytes={start}-'
+        return urllib.request.Request(self.url, headers=headers)
+
+    def _sleep_with_cancel(self, seconds):
+        end_time = time.monotonic() + seconds
+        while time.monotonic() < end_time:
+            if self.isInterruptionRequested():
+                return False
+            self.msleep(100)
+        return True
+
+    def _partial_size(self):
+        try:
+            if os.path.exists(self.part_path):
+                return os.path.getsize(self.part_path)
+        except OSError:
+            pass
+        return 0
+
+    def _reset_partial(self):
+        try:
+            if os.path.exists(self.part_path):
+                os.remove(self.part_path)
+        except OSError:
+            pass
+
+    def _download_once(self, attempt):
+        existing = self._partial_size()
+        if self.expected_size and existing >= self.expected_size:
+            existing = 0
+            self._reset_partial()
+        request = self._make_request(existing)
+        with urllib.request.urlopen(request, timeout=self.DOWNLOAD_TIMEOUT) as response:
+            code = getattr(response, 'status', response.getcode())
+            resumed = existing > 0 and code == 206
+            if existing > 0 and code != 206:
+                self.status_changed.emit('服务器未接受断点续传，正在从头重新下载...')
+                existing = 0
+                resumed = False
+                self._reset_partial()
+            total = self.expected_size
+            content_length = int(response.headers.get('Content-Length') or 0)
+            if not total:
+                total = existing + content_length if content_length else 0
+            mode = 'ab' if resumed else 'wb'
+            downloaded = existing if resumed else 0
+            start_time = time.monotonic()
+            last_emit = 0
+            os.makedirs(os.path.dirname(self.save_path) or '.', exist_ok=True)
+            self.progress_changed.emit(downloaded, total, 0.0, -1, resumed, attempt)
+            with open(self.part_path, mode) as f:
+                while True:
+                    if self.isInterruptionRequested():
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError:
+                            pass
+                        self.download_canceled.emit(self.part_path, downloaded)
+                        return False
+                    chunk = response.read(self.CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.monotonic()
+                    if now - last_emit >= 0.25:
+                        elapsed = max(now - start_time, 0.001)
+                        speed = max(downloaded - existing, 0) / elapsed
+                        eta = int((total - downloaded) / speed) if total > downloaded and speed > 0 else -1
+                        self.progress_changed.emit(downloaded, total, speed, eta, resumed, attempt)
+                        last_emit = now
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            if total and downloaded < total:
+                raise http.client.IncompleteRead(b'', total - downloaded)
+            if os.path.exists(self.save_path):
+                try:
+                    os.chmod(self.save_path, 0o666)
+                except OSError:
+                    pass
+            os.replace(self.part_path, self.save_path)
+            self.progress_changed.emit(downloaded, total, 0.0, -1, resumed, attempt)
+            self.download_completed.emit(self.save_path)
+            return True
+
+    def run(self):
+        last_error = None
+        for attempt in range(1, self.MAX_RETRIES + 2):
+            if self.isInterruptionRequested():
+                self.download_canceled.emit(self.part_path, self._partial_size())
+                return
+            try:
+                if attempt > 1:
+                    self.status_changed.emit(f'网络中断，正在重试 ({attempt - 1}/{self.MAX_RETRIES})...')
+                if self._download_once(attempt):
+                    return
+                return
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if e.code not in (500, 502, 503, 504) or attempt > self.MAX_RETRIES:
+                    break
+            except urllib.error.URLError as e:
+                last_error = e
+                if attempt > self.MAX_RETRIES:
+                    break
+            except (socket.timeout, TimeoutError, http.client.IncompleteRead, http.client.RemoteDisconnected, ConnectionError) as e:
+                last_error = e
+                if attempt > self.MAX_RETRIES:
+                    break
+            except OSError as e:
+                last_error = e
+                break
+            except Exception as e:
+                last_error = e
+                break
+            if not self._sleep_with_cancel(min(2 ** (attempt - 1), 8)):
+                self.download_canceled.emit(self.part_path, self._partial_size())
+                return
+        message = str(last_error) if last_error else '未知错误'
+        if isinstance(last_error, urllib.error.HTTPError):
+            message = f'GitHub 返回错误：HTTP {last_error.code}'
+        elif isinstance(last_error, urllib.error.URLError):
+            message = f'网络连接失败：{last_error.reason}'
+        self.download_failed.emit(message)
+
 
 class FolderScanThread(QThread):
     """文件夹扫描线程，用于异步加载项目文件夹"""
@@ -2052,7 +2207,12 @@ class MainWindow(QMainWindow):
         self.scan_thread.start()
 
     def closeEvent(self, event):
-        """退出时确保扫描线程已结束，避免 QThread 被销毁时仍在运行"""
+        """退出时确保后台线程已结束，避免 QThread 被销毁时仍在运行"""
+        update_thread = getattr(self, 'update_download_thread', None)
+        if update_thread is not None and update_thread.isRunning():
+            update_thread.requestInterruption()
+            update_thread.quit()
+            update_thread.wait(5000)
         thread = getattr(self, 'scan_thread', None)
         if thread is not None and thread.isRunning():
             thread.requestInterruption()
@@ -2742,6 +2902,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "错误", f"无法打开：{os.path.basename(path)}\n{str(e)}")
 
+    def _open_url(self, url):
+        """用默认浏览器打开网址。"""
+        try:
+            os.startfile(url)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开网页：\n{url}\n\n{str(e)}")
+
     def _terminal_launch_candidates(self, folder_path):
         """按优先级生成终端启动命令：Windows Terminal → PowerShell → cmd。"""
         return [
@@ -3167,9 +3334,19 @@ class MainWindow(QMainWindow):
             return f'{size / (1024 * 1024):.2f} MB'
         else:
             return f'{size / (1024 * 1024 * 1024):.2f} GB'
-    
+
+    def _format_duration(self, seconds):
+        if seconds is None or seconds < 0:
+            return '--:--'
+        seconds = int(seconds)
+        minutes, sec = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f'{hours:02d}:{minutes:02d}:{sec:02d}'
+        return f'{minutes:02d}:{sec:02d}'
+
     def _parse_version_tuple(self, version_text):
-        """把 v0.2.1 / 0.2.1 解析为可比较的数字元组。"""
+        """把 v0.2.3 / 0.2.3 解析为可比较的数字元组。"""
         cleaned = str(version_text or '').strip().lstrip('vV')
         parts = []
         for part in cleaned.split('.'):
@@ -3218,30 +3395,133 @@ class MainWindow(QMainWindow):
                 return asset
         return exe_assets[0]
 
-    def _download_update_asset(self, url, save_path):
-        request = urllib.request.Request(url, headers={'User-Agent': f'SeavoExplorer/{APP_VERSION}'})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            total = int(response.headers.get('Content-Length') or 0)
-            progress = QProgressDialog('正在下载更新...', '取消', 0, total if total > 0 else 0, self)
-            progress.setWindowTitle('下载更新')
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            downloaded = 0
-            with open(save_path, 'wb') as f:
-                while True:
-                    QApplication.processEvents()
-                    if progress.wasCanceled():
-                        raise Exception('已取消下载')
-                    chunk = response.read(1024 * 128)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        progress.setValue(downloaded)
-                    else:
-                        progress.setLabelText(f'正在下载更新... {downloaded / 1024 / 1024:.1f} MB')
-            progress.setValue(total if total > 0 else 0)
+    def _build_update_download_message(self, asset_name, downloaded, total, speed, eta, resumed, attempt):
+        lines = [f'正在下载更新：{asset_name}']
+        if total > 0:
+            percent = downloaded * 100 / total if total else 0
+            lines.append(f'{self.format_file_size(downloaded)} / {self.format_file_size(total)} ({percent:.1f}%)')
+        else:
+            lines.append(f'已下载 {self.format_file_size(downloaded)}')
+        if speed > 0:
+            lines.append(f'速度：{self.format_file_size(int(speed))}/s')
+        if eta >= 0:
+            lines.append(f'预计剩余：{self._format_duration(eta)}')
+        if resumed:
+            lines.append('状态：断点续传')
+        if attempt > 1:
+            lines.append(f'重试：第 {attempt} 次')
+        return '\n'.join(lines)
+
+    def _ask_open_release_page(self, title, message, release_url):
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Question)
+        box.setText(message)
+        open_btn = box.addButton('打开发布页', QMessageBox.AcceptRole)
+        box.addButton('取消', QMessageBox.RejectRole)
+        box.setDefaultButton(open_btn)
+        box.exec_()
+        if box.clickedButton() == open_btn:
+            self._open_url(release_url)
+            return True
+        return False
+
+    def _ask_download_update(self, message):
+        box = QMessageBox(self)
+        box.setWindowTitle('发现新版本')
+        box.setIcon(QMessageBox.Question)
+        box.setText(message)
+        download_btn = box.addButton('下载更新', QMessageBox.AcceptRole)
+        browser_btn = box.addButton('浏览器打开', QMessageBox.ActionRole)
+        box.addButton('取消', QMessageBox.RejectRole)
+        box.setDefaultButton(download_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == download_btn:
+            return 'download'
+        if clicked == browser_btn:
+            return 'browser'
+        return 'cancel'
+
+    def _ask_open_download_folder(self, downloaded_path):
+        box = QMessageBox(self)
+        box.setWindowTitle('下载完成')
+        box.setIcon(QMessageBox.Information)
+        box.setText(f'更新文件已下载完成。\n\n保存位置：\n{downloaded_path}')
+        open_btn = box.addButton('打开文件夹', QMessageBox.AcceptRole)
+        box.addButton('关闭', QMessageBox.RejectRole)
+        box.setDefaultButton(open_btn)
+        box.exec_()
+        return box.clickedButton() == open_btn
+
+    def _download_update_asset(self, url, save_path, asset_name='', expected_size=0):
+        progress = QProgressDialog('正在下载更新...', '取消', 0, 0, self)
+        progress.setWindowTitle('下载更新')
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        result = {'path': None, 'error': None, 'canceled': False}
+        thread = UpdateDownloadThread(url, save_path, expected_size, self)
+        self.update_download_thread = thread
+
+        def update_progress(downloaded, total, speed, eta, resumed, attempt):
+            if total > 0:
+                if progress.maximum() != total:
+                    progress.setRange(0, total)
+            else:
+                if progress.maximum() != 0:
+                    progress.setRange(0, 0)
+            progress.setValue(downloaded if total > 0 else 0)
+            progress.setLabelText(self._build_update_download_message(asset_name or os.path.basename(save_path), downloaded, total, speed, eta, resumed, attempt))
+
+        def update_status(text):
+            progress.setLabelText(text)
+
+        def download_completed(path):
+            result['path'] = path
+            progress.accept()
+
+        def download_failed(message):
+            result['error'] = message
+            progress.reject()
+
+        def download_canceled(part_path, downloaded):
+            result['canceled'] = True
+            result['path'] = part_path
+            progress.reject()
+
+        def cancel_download():
+            result['canceled'] = True
+            thread.requestInterruption()
+
+        thread.progress_changed.connect(update_progress)
+        thread.status_changed.connect(update_status)
+        thread.download_completed.connect(download_completed)
+        thread.download_failed.connect(download_failed)
+        thread.download_canceled.connect(download_canceled)
+        progress.canceled.connect(cancel_download)
+
+        try:
+            thread.start()
+            progress.exec_()
+            if thread.isRunning():
+                thread.requestInterruption()
+                thread.wait(5000)
+            if result['path'] and not result['canceled'] and not result['error']:
+                return result['path']
+            if result['canceled']:
+                return None
+            if result['error']:
+                raise RuntimeError(result['error'])
+            raise RuntimeError('更新下载失败')
+        finally:
+            if thread.isRunning():
+                thread.requestInterruption()
+                thread.wait(5000)
+            if getattr(self, 'update_download_thread', None) is thread:
+                self.update_download_thread = None
 
     def check_for_updates(self):
         """检查 GitHub Releases 并可选下载最新 exe。"""
@@ -3253,23 +3533,38 @@ class MainWindow(QMainWindow):
             release_url = release_data.get('html_url') or GITHUB_RELEASES_URL
             asset = self._pick_release_exe_asset(release_data)
             if not tag_name:
-                QMessageBox.warning(self, '检查更新', '未能从 GitHub Release 获取版本号。')
+                QMessageBox.warning(self, '检查更新', f'未能获取最新版本号。\n\n发布页：{release_url}')
                 return
             if not self._is_newer_version(latest_version, APP_VERSION):
-                QMessageBox.information(self, '检查更新', f'当前已是最新版本：{APP_VERSION}\n\n{release_url}')
+                QMessageBox.information(self, '检查更新', f'当前已是最新版本。\n\n当前版本：{APP_VERSION}\n发布页：{release_url}')
                 return
             if not asset:
-                QMessageBox.information(self, '发现新版本', f'发现新版本 {tag_name}，但该 Release 未包含 exe 附件。\n\n{release_url}')
+                self._ask_open_release_page(
+                    '发现新版本',
+                    f'发现新版本：{tag_name}\n当前版本：{APP_VERSION}\n\n该版本未提供 exe 安装包。\n发布页：{release_url}',
+                    release_url,
+                )
                 return
 
             asset_name = asset.get('name') or 'SeavoExplorer.exe'
-            size_mb = (asset.get('size') or 0) / 1024 / 1024
-            msg = f'发现新版本：{tag_name}\n当前版本：{APP_VERSION}\n附件：{asset_name}'
+            asset_size = int(asset.get('size') or 0)
+            size_mb = asset_size / 1024 / 1024
+            asset_line = f'更新文件：{asset_name}'
             if size_mb > 0:
-                msg += f'（{size_mb:.1f} MB）'
-            msg += '\n\n是否下载最新 exe？'
-            reply = QMessageBox.question(self, '发现新版本', msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-            if reply != QMessageBox.Yes:
+                asset_line += f'（{size_mb:.1f} MB）'
+            msg = (
+                f'发现新版本：{tag_name}\n'
+                f'当前版本：{APP_VERSION}\n'
+                f'{asset_line}\n'
+                f'发布页：{release_url}\n\n'
+                '是否下载更新文件？\n'
+                '如果下载失败，可以改用浏览器打开发布页下载。'
+            )
+            action = self._ask_download_update(msg)
+            if action == 'browser':
+                self._open_url(release_url)
+                return
+            if action != 'download':
                 return
 
             default_name = self._versioned_exe_name(asset_name, tag_name)
@@ -3280,25 +3575,43 @@ class MainWindow(QMainWindow):
             if not save_path.lower().endswith('.exe'):
                 save_path += '.exe'
 
-            self._download_update_asset(asset.get('browser_download_url'), save_path)
-            self.statusBar().showMessage(f'更新已下载: {save_path}')
-            done = QMessageBox.question(self, '下载完成', f'已下载到：\n{save_path}\n\n是否打开所在文件夹？', QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-            if done == QMessageBox.Yes:
-                self._open_with_shell(os.path.dirname(save_path))
+            downloaded_path = self._download_update_asset(asset.get('browser_download_url'), save_path, asset_name, asset_size)
+            if not downloaded_path:
+                return
+            self.statusBar().showMessage(f'更新已下载: {downloaded_path}')
+            if self._ask_open_download_folder(downloaded_path):
+                self._open_with_shell(os.path.dirname(downloaded_path))
         except urllib.error.HTTPError as e:
-            QMessageBox.warning(self, '检查更新失败', f'GitHub 返回错误：HTTP {e.code}\n请稍后重试或手动访问：\n{GITHUB_RELEASES_URL}')
+            self._ask_open_release_page(
+                '检查更新失败',
+                f'GitHub 返回错误：HTTP {e.code}\n\n发布页：{GITHUB_RELEASES_URL}',
+                GITHUB_RELEASES_URL,
+            )
         except urllib.error.URLError as e:
-            QMessageBox.warning(self, '检查更新失败', f'无法连接 GitHub：{e.reason}\n请检查网络后重试。')
+            self._ask_open_release_page(
+                '检查更新失败',
+                f'无法连接 GitHub。\n原因：{e.reason}\n\n发布页：{GITHUB_RELEASES_URL}',
+                GITHUB_RELEASES_URL,
+            )
+        except RuntimeError as e:
+            message = str(e)
+            if message:
+                self._ask_open_release_page(
+                    '下载失败',
+                    f'{message}\n\n发布页：{GITHUB_RELEASES_URL}\n\n可改用浏览器下载。',
+                    GITHUB_RELEASES_URL,
+                )
         except Exception as e:
-            QMessageBox.warning(self, '检查更新失败', str(e))
+            QMessageBox.warning(self, '检查更新失败', f'检查更新时发生错误：\n{str(e)}')
         finally:
             self.statusBar().clearMessage()
+
 
     def show_about(self):
         about_text = (
             '<h3>SeavoExplorer - 主板项目文件浏览器</h3>'
             f'<p>版本 {APP_VERSION}</p>'
-            '<p>本版本新增快捷访问右键管理、文件夹终端打开，并完善使用帮助与新手向导。</p>'
+            '<p>本版本重点优化检查更新与下载更新：后台下载更流畅，支持失败重试、断点续传、临时文件保护，并提供浏览器发布页兜底；同时整理更新弹窗文案并移除无实际功能的标题栏帮助按钮。</p>'
             f'<p>GitHub：<a href="{GITHUB_REPO_URL}">{GITHUB_REPO_URL}</a></p>'
         )
         # 关于页 logo 优先用高清 PNG 源（清晰放大），回退到多尺寸 ico
@@ -3352,7 +3665,16 @@ class MainWindow(QMainWindow):
 <li>如需预览/解压 <code>.rar</code>、<code>.7z</code>，请在 <b>设置 → 7-Zip路径设置</b> 中确认 7z.exe 可用。</li>
 </ol>
 
-<h3 style="color: #2980b9;">二、项目文件夹管理</h3>
+<h3 style="color: #2980b9;">二、检查更新与下载更新</h3>
+<ul>
+<li>点击 <b>帮助 → 检查更新</b>，程序会读取 GitHub Releases 上的最新版本并与当前版本比较。</li>
+<li>发现新版本时，弹窗会显示版本号、更新文件大小和发布页链接，可选择 <b>下载更新</b> 或 <b>浏览器打开</b>。</li>
+<li>程序内下载会在后台进行，进度窗口显示下载量、速度和预计剩余时间；网络中断时会自动重试，已有临时文件时会尽量断点续传。</li>
+<li>取消或失败时会保留 <code>.part</code> 临时文件，稍后再次下载同一文件可继续利用已下载部分。</li>
+<li>如果 GitHub 连接较慢或下载失败，可使用弹窗中的发布页链接，在浏览器中手动下载最新 <code>SeavoExplorer.exe</code>。</li>
+</ul>
+
+<h3 style="color: #2980b9;">三、项目文件夹管理</h3>
 <p><b>1. 配置项目根目录</b></p>
 <p>点击菜单 <b>设置 → 项目文件夹设置</b>，添加包含项目文件夹的根目录。程序会扫描这些目录下符合命名规则的项目文件夹。</p>
 <p>命名规则：以 <b>S</b>（主板）或 <b>M</b>（子卡）开头，后跟 <b>3~4 位数字</b>，可选 <code>_注释</code> 后缀。例如：<code>S001</code>、<code>M1234</code>、<code>S002_样机</code>、<code>M003_说明</code>。</p>
@@ -3373,7 +3695,7 @@ class MainWindow(QMainWindow):
 </ul>
 <p style="color: #7f8c8d;">注释显示优先级：若 <code>seavo_comments.json</code> 中对该文件夹有注释则优先显示，否则使用文件夹名的 <code>_注释</code> 后缀。</p>
 
-<h3 style="color: #2980b9;">三、文件浏览与操作</h3>
+<h3 style="color: #2980b9;">四、文件浏览与操作</h3>
 <p><b>1. 文件浏览</b></p>
 <ul>
 <li>单击文件：在下方 <b>文件预览</b> 区显示内容；<b>元数据</b> 标签页显示大小、创建/修改时间等详情</li>
@@ -3491,8 +3813,11 @@ class MainWindow(QMainWindow):
 <li><b>不小心删除文件</b>：程序会移入系统回收站，可点击状态栏右侧回收站按钮打开并恢复</li>
 <li><b>预览内容乱码</b>：文本预览会尝试 UTF-8 / GBK；若仍乱码，请用专业编辑器或对应软件打开原文件</li>
 </ul>
-''')
-        
+<h3 style="color: #2980b9;">十一、关于更新</h3>
+<p>如果你使用“帮助 → 检查更新”，程序会优先尝试在应用内下载更新；若网络较慢或下载失败，可直接打开 GitHub Releases 页面用浏览器下载。</p>
+'''
+        )
+
         layout.addWidget(help_text)
         
         close_btn = QPushButton('关闭')
@@ -3634,6 +3959,7 @@ class MainWindow(QMainWindow):
 if __name__ == '__main__':
     try:
         app = QApplication(sys.argv)
+        app.setAttribute(Qt.AA_DisableWindowContextHelpButton)
 
         # 设置全局界面字体：优先使用系统中可用的清晰字体
         apply_app_font(app)
