@@ -58,6 +58,15 @@ There is currently no test suite or lint configuration in this repository. Do no
 
 - When reading normal text/code files with the Read tool, omit optional PDF-only parameters such as `pages`; never pass empty optional values like `pages: ""`. Use `pages` only for PDF files and only with a valid page range such as `"1"` or `"1-5"`.
 
+## Model assignment convention
+
+This is a soft convention for which model tier to use per task type. The main conversation loop's model is set by the user (`/model`, `/fast`) and cannot self-switch; this only governs which `model` to specify when spawning `Agent`/`Workflow` subagents.
+
+- Keep the **main loop on Opus** for: core `main.py` changes (scan, preview, archive, file ops), cross-feature refactors, code review, and any Windows-specific logic (`safe_write_json`, frozen `app_dir` branch, recycle-bin `ctypes`, 7-Zip detection). Coupling is high in this monolith, so correctness wins over token cost.
+- Spawn **Sonnet subagents** for mechanical, low-risk work with clear rules: aligning the three packaging configs (`build_onefile.py` / `build_onedir.py` / `main.spec`), `release.py` constant/version bumps, and doc/README/comment writing.
+- Spawn **Explore subagents with a small model (Sonnet/Haiku)** for pure search/locate tasks where only the conclusion is needed.
+- When a Sonnet subagent touches the packaging configs, instruct it to read all three files before editing — they drift easily and a partial edit looks complete.
+
 ## Architecture
 
 ### Core application shape
