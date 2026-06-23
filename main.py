@@ -30,7 +30,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeView, QTextEdit,
                                 QDialog, QGridLayout, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QFormLayout,
                                 QRadioButton, QButtonGroup, QInputDialog, QSplashScreen,
-                                QToolBar, QToolButton, QSizePolicy, QProgressDialog)
+                                QToolBar, QToolButton, QSizePolicy, QProgressDialog,
+                                QCheckBox)
 from PyQt5.QtCore import QDir, Qt, QModelIndex, QThread, pyqtSignal, QRect, QUrl, QMimeData, QTimer
 from PyQt5.QtGui import QFont, QPixmap, QImage, QIcon, QPainter, QColor, QPen, QKeySequence, QFontDatabase
 
@@ -79,6 +80,18 @@ IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.webp',
 VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v', '.webm', '.mpg', '.mpeg', '.3gp')
 ARCHIVE_EXTS = ('.zip', '.rar', '.7z')
 TEXT_EXTS = ('.txt', '.csv', '.log', '.bom', '.drc', '.rep', '.rpt', '.md', '.json', '.xml', '.html', '.htm', '.ini', '.cfg')
+
+# 可分类开关的预览类别：(设置 key, 中文名)。顺序即「预览设置」对话框中的展示顺序。
+# 二进制兜底与加密类型不在此列（前者只读前1000字节，后者只显示提示，均无卡顿风险）。
+PREVIEW_CATEGORIES = (
+    ('text', '文本'),
+    ('pdf', 'PDF'),
+    ('image', '图片'),
+    ('video', '视频'),
+    ('archive', '压缩包'),
+    ('excel', '表格'),
+    ('word', '文档'),
+)
 
 
 def _first_available_font(candidates):
@@ -1543,6 +1556,14 @@ class MainWindow(QMainWindow):
         self.preview_tab.setReadOnly(True)
         self.preview_tab.setFont(get_mono_font(10))
         self.preview_layout.addWidget(self.preview_tab)
+
+        # 预览被关闭时显示的按钮：点击后才真正读取并预览该文件
+        self.preview_button = QPushButton('显示预览')
+        self.preview_button.setMinimumHeight(40)
+        self.preview_button.clicked.connect(self._on_preview_button_clicked)
+        self.preview_layout.addWidget(self.preview_button)
+        self.preview_button.hide()
+        self._pending_preview_path = None
         
         # 图片预览
         self.image_scroll_area = QScrollArea()
@@ -1593,6 +1614,7 @@ class MainWindow(QMainWindow):
         settings_menu.addAction('项目文件夹设置', self.show_settings_dialog)
         settings_menu.addAction('快捷访问设置', self.show_quick_access_settings_dialog)
         settings_menu.addAction('7-Zip路径设置', self.show_7zip_settings_dialog)
+        settings_menu.addAction('预览设置', self.show_preview_settings_dialog)
         settings_menu.addAction('恢复已隐藏项目', self.show_restore_hidden_projects_dialog)
         help_menu = menubar.addMenu('帮助')
         help_menu.addAction('新手向导', self.show_wizard)
@@ -1615,6 +1637,9 @@ class MainWindow(QMainWindow):
         self.pinned_folders = []
         self.hidden_folders = []
         self.wizard_shown = False
+        # 各类文件预览开关：关闭后点击对应文件不自动读取，改为显示「显示预览」按钮，降低卡顿
+        for key, _name in PREVIEW_CATEGORIES:
+            setattr(self, f'preview_{key}_enabled', True)
 
     def _get_default_quick_access_paths(self):
         """获取默认快捷访问路径"""
@@ -1689,6 +1714,10 @@ class MainWindow(QMainWindow):
                 self.hidden_folders = config_data['hidden_folders']
             if 'wizard_shown' in config_data:
                 self.wizard_shown = config_data['wizard_shown']
+            for key, _name in PREVIEW_CATEGORIES:
+                cfg_key = f'preview_{key}_enabled'
+                if cfg_key in config_data:
+                    setattr(self, cfg_key, config_data[cfg_key])
         except Exception:
             self._init_default_settings()
         return self.project_paths
@@ -1744,6 +1773,9 @@ class MainWindow(QMainWindow):
                 'hidden_folders': getattr(self, 'hidden_folders', []),
                 'wizard_shown': getattr(self, 'wizard_shown', False)
             }
+            for key, _name in PREVIEW_CATEGORIES:
+                cfg_key = f'preview_{key}_enabled'
+                config_data[cfg_key] = getattr(self, cfg_key, True)
             if hasattr(self, 'folder_structure'):
                 config_data['folder_structure'] = self.folder_structure
             if default_new_project_folder:
@@ -1822,7 +1854,48 @@ class MainWindow(QMainWindow):
             self.archive_tool_path = new_path
             self.save_settings_to_file(self.settings, self.include_subfolders)
             QMessageBox.information(self, '成功', '7-Zip路径设置已保存')
-    
+
+    def show_preview_settings_dialog(self):
+        """显示预览开关对话框：分别控制各类文件的自动预览。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle('预览设置')
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel('关闭后，点击对应类型的文件不会自动读取预览，\n而是在预览区显示一个「显示预览」按钮，需手动点击才加载。'))
+
+        # 每个类别一个复选框，标签附带常见扩展名示例
+        EXAMPLES = {
+            'text': 'txt/csv/log/md 等',
+            'pdf': 'pdf',
+            'image': 'jpg/png/gif 等',
+            'video': 'mp4/avi/mov 等',
+            'archive': 'zip/rar/7z',
+            'excel': 'xlsx/xlsm/xls',
+            'word': 'docx/doc',
+        }
+        checkboxes = {}
+        for key, name in PREVIEW_CATEGORIES:
+            example = EXAMPLES.get(key, '')
+            cb = QCheckBox(f'{name}预览（{example}）' if example else f'{name}预览')
+            cb.setChecked(getattr(self, f'preview_{key}_enabled', True))
+            layout.addWidget(cb)
+            checkboxes[key] = cb
+
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton('确定')
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton('取消')
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        dialog.setLayout(layout)
+        if dialog.exec_():
+            for key, cb in checkboxes.items():
+                setattr(self, f'preview_{key}_enabled', cb.isChecked())
+            self.save_settings_to_file(self.settings, self.include_subfolders)
+
     def _create_quick_access_buttons(self, layout):
         for btn in list(self.quick_access_buttons):
             layout.removeWidget(btn)
@@ -2328,7 +2401,7 @@ class MainWindow(QMainWindow):
                 self.current_folder = None
                 self.file_model.setRootPath('')
                 self.file_tree.setRootIndex(QModelIndex())
-                self.preview_tab.clear()
+                self._reset_preview()
                 self.metadata_tab.clear()
                 self.new_structure_btn.setEnabled(False)
             self.save_settings_to_file(self.settings, self.include_subfolders)
@@ -2403,7 +2476,7 @@ class MainWindow(QMainWindow):
             self.current_folder = folder_path
             self.file_model.setRootPath(folder_path)
             self.file_tree.setRootIndex(self.file_model.index(folder_path))
-            self.preview_tab.clear()
+            self._reset_preview()
             self.metadata_tab.clear()
             self.new_structure_btn.setEnabled(True)
             self._update_folder_status_bar()
@@ -2451,7 +2524,7 @@ class MainWindow(QMainWindow):
             self.preview_file(file_path)
             self.extract_metadata(file_info)
         else:
-            self.preview_tab.clear()
+            self._reset_preview()
             self.metadata_tab.clear()
     
     def on_file_tree_context_menu(self, position):
@@ -3278,7 +3351,57 @@ class MainWindow(QMainWindow):
             content += f.read(1000).hex(' ')
         self.preview_tab.setPlainText(content)
 
+    def _preview_category(self, ext):
+        """把扩展名归类到一个预览类别 key，及其中文名。返回 (key, 中文名) 或 (None, None) 表示不受开关控制。"""
+        if ext in TEXT_EXTS or ext in ['.bom', '.drc', '.rep', '.rpt']:
+            return 'text', '文本'
+        if ext == '.pdf':
+            return 'pdf', 'PDF'
+        if ext in IMAGE_EXTS:
+            return 'image', '图片'
+        if ext in VIDEO_EXTS:
+            return 'video', '视频'
+        if ext in ARCHIVE_EXTS:
+            return 'archive', '压缩包'
+        if ext in ['.xlsx', '.xlsm', '.xls']:
+            return 'excel', '表格'
+        if ext in ['.docx', '.doc']:
+            return 'word', '文档'
+        # 二进制兜底（仅读前1000字节，开销小）与加密类型（只显示提示）不参与开关
+        return None, None
+
     def preview_file(self, file_path):
+        """预览入口：若对应文件类型的预览被关闭，则只显示「显示预览」按钮，不立即读取文件。"""
+        ext = os.path.splitext(file_path)[1].lower()
+        key, type_name = self._preview_category(ext)
+        if key and not getattr(self, f'preview_{key}_enabled', True):
+            self._show_preview_button(file_path, type_name)
+            return
+        self._do_preview(file_path)
+
+    def _show_preview_button(self, file_path, type_name):
+        """隐藏预览区域，改为显示一个按钮，点击后才加载预览。"""
+        self.preview_tab.hide()
+        self.image_scroll_area.hide()
+        self._pending_preview_path = file_path
+        self.preview_button.setText(f'显示预览（{type_name}）：{os.path.basename(file_path)}')
+        self.preview_button.show()
+
+    def _on_preview_button_clicked(self):
+        path = self._pending_preview_path
+        if path and os.path.exists(path):
+            self.preview_button.hide()
+            self._do_preview(path)
+
+    def _reset_preview(self):
+        """恢复预览区域到文本视图并清空，隐藏按钮与图片区域。"""
+        self._pending_preview_path = None
+        self.preview_button.hide()
+        self.image_scroll_area.hide()
+        self.preview_tab.show()
+        self.preview_tab.clear()
+
+    def _do_preview(self, file_path):
         try:
             ext = os.path.splitext(file_path)[1].lower()
             text_exts = TEXT_EXTS
@@ -3286,6 +3409,7 @@ class MainWindow(QMainWindow):
             video_exts = VIDEO_EXTS
             archive_exts = ARCHIVE_EXTS
 
+            self.preview_button.hide()
             self.preview_tab.show()
             self.image_scroll_area.hide()
 
