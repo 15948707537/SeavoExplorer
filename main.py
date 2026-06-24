@@ -557,6 +557,46 @@ class FolderScanThread(QThread):
             self.scan_completed.emit(motherboard_folders, daughterboard_folders)
 
 
+class FolderStatsThread(QThread):
+    """递归统计某文件夹的文件数与总大小（off UI 线程，避免大目录/网络盘冻结界面）。"""
+    stats_ready = pyqtSignal(int, int, int, bool)  # (token, file_count, total_size, truncated)
+
+    MAX_FILES = 50000  # 软上限：超过即停，UI 显示 50000+
+
+    def __init__(self, root, token):
+        super().__init__()
+        self.root = root
+        self.token = token
+
+    def run(self):
+        count = 0
+        total = 0
+        truncated = False
+        try:
+            for dirpath, dirnames, filenames in os.walk(self.root):
+                if self.isInterruptionRequested():
+                    return
+                for name in filenames:
+                    if self.isInterruptionRequested():
+                        return
+                    count += 1
+                    try:
+                        total += os.path.getsize(os.path.join(dirpath, name))
+                    except OSError:
+                        # 权限/失联/已删除等：跳过单个文件，不中断整体
+                        pass
+                    if count >= self.MAX_FILES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+        except Exception:
+            # os.walk 顶层异常（root 失联等）：发已累计的部分结果
+            pass
+        if not self.isInterruptionRequested():
+            self.stats_ready.emit(self.token, count, total, truncated)
+
+
 class NewProjectDialog(QDialog):
     def __init__(self, parent=None, default_folder='D:\资料'):
         super().__init__(parent)
@@ -1607,6 +1647,12 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 3)
         content_layout.addWidget(self.splitter)
 
+        # 状态栏右侧：项目文件数/大小统计（常驻，不与 showMessage 临时消息冲突）
+        self._stats_token = 0
+        self._stats_thread = None
+        self.folder_stats_label = QLabel('')
+        self.folder_stats_label.setStyleSheet('color: #555; padding: 0 8px;')
+        self.statusBar().addPermanentWidget(self.folder_stats_label)
         # 在状态栏右侧添加回收站按钮
         self.statusBar().addPermanentWidget(self._create_recycle_btn())
 
@@ -2364,6 +2410,11 @@ class MainWindow(QMainWindow):
             thread.requestInterruption()
             thread.quit()
             thread.wait(3000)
+        stats_thread = getattr(self, '_stats_thread', None)
+        if stats_thread is not None and stats_thread.isRunning():
+            stats_thread.requestInterruption()
+            stats_thread.quit()
+            stats_thread.wait(2000)
         # 记住窗口几何/最大化标志/主分栏位置，保存失败绝不阻塞关闭
         try:
             # normalGeometry() 返回非最大化时的几何；若窗口从未被最大化过，某些平台返回 0 尺寸 → 回退到 geometry()
@@ -2542,6 +2593,13 @@ class MainWindow(QMainWindow):
                 # 清空面包屑
                 self._breadcrumb_path = None
                 self._rebuild_breadcrumb()
+                # 清空文件统计 + 取消在跑的统计线程
+                self._stats_token += 1
+                self.folder_stats_label.setText('')
+                stats_t = getattr(self, '_stats_thread', None)
+                if stats_t is not None and stats_t.isRunning():
+                    stats_t.requestInterruption()
+                    stats_t.quit()
             # 同步清空「上次项目」记录，避免下次恢复指向已隐藏/删除的项目
             if getattr(self, 'last_project_path', None) == folder_path:
                 self.last_project_path = None
@@ -3230,7 +3288,36 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage(f"当前文件夹：S{number}")
                 else:
                     self.statusBar().showMessage(f"当前文件夹：M{number}")
-    
+        # 同步刷新文件数/大小统计
+        self._refresh_folder_stats()
+
+    def _refresh_folder_stats(self):
+        """启动后台线程统计 current_folder 的文件数与总大小。token 机制丢弃过期结果。"""
+        self._stats_token += 1
+        token = self._stats_token
+        # 取消上一个线程（不 wait，避免阻塞 UI；过期结果靠 token 丢弃）
+        old = getattr(self, '_stats_thread', None)
+        if old is not None and old.isRunning():
+            old.requestInterruption()
+            old.quit()
+        root = getattr(self, 'current_folder', None)
+        if not root or not os.path.isdir(root):
+            self.folder_stats_label.setText('')
+            return
+        self.folder_stats_label.setText('统计中…')
+        self._stats_thread = FolderStatsThread(root, token)
+        self._stats_thread.stats_ready.connect(self._on_stats_ready)
+        self._stats_thread.start()
+
+    def _on_stats_ready(self, token, count, size, truncated):
+        """统计线程回调：仅接受当前 token 的结果。"""
+        if token != self._stats_token:
+            return  # 过期，丢弃
+        if truncated:
+            self.folder_stats_label.setText(f'{count}+ 个文件 · ≥{self.format_file_size(size)}')
+        else:
+            self.folder_stats_label.setText(f'{count} 个文件 · {self.format_file_size(size)}')
+
     def move_to_recycle(self, file_path):
         """移入回收站"""
         self._move_paths_to_recycle([file_path])
