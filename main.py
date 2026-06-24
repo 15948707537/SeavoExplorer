@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeView, QTextEdit,
                                 QRadioButton, QButtonGroup, QInputDialog, QSplashScreen,
                                 QToolBar, QToolButton, QSizePolicy, QProgressDialog,
                                 QCheckBox)
-from PyQt5.QtCore import QDir, Qt, QModelIndex, QThread, pyqtSignal, QRect, QUrl, QMimeData, QTimer
+from PyQt5.QtCore import QDir, Qt, QModelIndex, QThread, pyqtSignal, QRect, QUrl, QMimeData, QTimer, QEvent
 from PyQt5.QtGui import QFont, QPixmap, QImage, QIcon, QPainter, QColor, QPen, QKeySequence, QFontDatabase
 
 _SPLASH_PIXMAP = None
@@ -1607,22 +1607,32 @@ class MainWindow(QMainWindow):
         self._restore_splitter_sizes()
     
     def _restore_window_geometry(self):
-        """用持久化的窗口几何覆盖默认值；值缺失或非法（非四元、含非正宽高、完全在屏幕外）则保持默认，不抛错。"""
+        """用持久化的窗口几何与最大化标志恢复主窗口。
+
+        - 校验几何（非四元、含非正宽高、完全在屏幕外）非法则保持默认；
+        - 若 window_maximized 为真：先确保有合法的"普通几何"作为取消最大化后的回弹尺寸，再 showMaximized()；
+        - 任何异常都安全退化，不抛错。
+        """
         geo = getattr(self, 'window_geometry', None)
+        maximized = bool(getattr(self, 'window_maximized', False))
+        geo_applied = False
         try:
-            if not (isinstance(geo, (list, tuple)) and len(geo) == 4):
-                return
-            x, y, w, h = (int(v) for v in geo)
-            if w <= 0 or h <= 0:
-                return
-            # 屏幕边界检查：窗口矩形与可用桌面区域必须有交集，否则会出现在不可见处
-            desktop = QApplication.desktop()
-            screen_rect = desktop.availableGeometry(QRect(x, y, w, h).center())
-            if not screen_rect.intersects(QRect(x, y, w, h)):
-                return
-            self.setGeometry(x, y, w, h)
+            if isinstance(geo, (list, tuple)) and len(geo) == 4:
+                x, y, w, h = (int(v) for v in geo)
+                if w > 0 and h > 0:
+                    # 屏幕边界检查：窗口矩形与所在屏幕的可用桌面区域必须有交集
+                    rect = QRect(x, y, w, h)
+                    desktop = QApplication.desktop()
+                    screen_rect = desktop.availableGeometry(rect.center())
+                    if screen_rect.intersects(rect):
+                        self.setGeometry(rect)
+                        geo_applied = True
         except (TypeError, ValueError):
-            return
+            pass
+        # 几何非法但要求最大化：保持当前默认几何（来自 initUI 的 setGeometry(100,100,1400,900)），
+        # 这样用户取消最大化后会回到合理尺寸，而不是 Qt 内部某个微小默认。
+        if maximized:
+            self.showMaximized()
 
     def _restore_splitter_sizes(self):
         """用持久化的分栏尺寸恢复主分栏；值缺失或非法则保持默认，不抛错。"""
@@ -1677,6 +1687,7 @@ class MainWindow(QMainWindow):
         # 窗口几何与主分栏位置（None 表示用内置默认，由 _restore_* 校验后恢复）
         self.window_geometry = None
         self.splitter_sizes = None
+        self.window_maximized = False
 
     def _get_default_quick_access_paths(self):
         """获取默认快捷访问路径"""
@@ -1759,6 +1770,8 @@ class MainWindow(QMainWindow):
                 self.window_geometry = config_data['window_geometry']
             if 'splitter_sizes' in config_data:
                 self.splitter_sizes = config_data['splitter_sizes']
+            if 'window_maximized' in config_data:
+                self.window_maximized = bool(config_data['window_maximized'])
         except Exception:
             self._init_default_settings()
         return self.project_paths
@@ -1819,6 +1832,7 @@ class MainWindow(QMainWindow):
                 config_data[cfg_key] = getattr(self, cfg_key, True)
             config_data['window_geometry'] = getattr(self, 'window_geometry', None)
             config_data['splitter_sizes'] = getattr(self, 'splitter_sizes', None)
+            config_data['window_maximized'] = bool(getattr(self, 'window_maximized', False))
             if hasattr(self, 'folder_structure'):
                 config_data['folder_structure'] = self.folder_structure
             if default_new_project_folder:
@@ -2334,16 +2348,34 @@ class MainWindow(QMainWindow):
             thread.requestInterruption()
             thread.quit()
             thread.wait(3000)
-        # 记住窗口几何与主分栏位置，保存失败绝不阻塞关闭
+        # 记住窗口几何/最大化标志/主分栏位置，保存失败绝不阻塞关闭
         try:
-            geo = self.geometry()
-            self.window_geometry = [geo.x(), geo.y(), geo.width(), geo.height()]
+            # normalGeometry() 返回非最大化时的几何；若窗口从未被最大化过，某些平台返回 0 尺寸 → 回退到 geometry()
+            ngeo = self.normalGeometry()
+            if ngeo.width() <= 0 or ngeo.height() <= 0:
+                ngeo = self.geometry()
+            self.window_geometry = [ngeo.x(), ngeo.y(), ngeo.width(), ngeo.height()]
+            self.window_maximized = bool(self.isMaximized())
             if hasattr(self, 'splitter'):
                 self.splitter_sizes = list(self.splitter.sizes())
             self.save_settings_to_file(self.settings, self.include_subfolders)
         except Exception:
             pass
         super().closeEvent(event)
+
+    def changeEvent(self, event):
+        """禁止全屏：任何走向全屏的状态变更（F11、外部 API 调用等）都立即拉回普通/最大化态。"""
+        try:
+            if event.type() == QEvent.WindowStateChange and self.isFullScreen():
+                # 清掉全屏位，保留其它状态位（如最大化）
+                self.setWindowState(self.windowState() & ~Qt.WindowFullScreen)
+                try:
+                    self.statusBar().showMessage('已禁用全屏模式', 3000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        super().changeEvent(event)
 
     def on_scan_progress(self, message):
         """处理扫描进度更新"""
@@ -4102,6 +4134,10 @@ class MainWindow(QMainWindow):
             return None
     
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_F11:
+            # 双保险：拦掉 F11，配合 changeEvent 阻全屏
+            event.accept()
+            return
         if event.key() == Qt.Key_F5:
             self.load_filtered_folders()
             if self.current_folder:
