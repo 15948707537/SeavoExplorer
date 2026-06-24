@@ -1422,6 +1422,8 @@ class MainWindow(QMainWindow):
         self.initUI()
         # 异步加载文件夹，提高启动速度
         self.load_filtered_folders_async()
+        # 记录待恢复的上次项目，待扫描完成（表就绪）后由 on_scan_completed 触发恢复
+        self._pending_restore_project = getattr(self, 'last_project_path', None)
         # UI 就绪后弹出加载期累积的警告（配置/注释损坏等）
         if self._pending_load_warnings:
             QTimer.singleShot(0, self._show_pending_load_warnings)
@@ -1688,6 +1690,8 @@ class MainWindow(QMainWindow):
         self.window_geometry = None
         self.splitter_sizes = None
         self.window_maximized = False
+        # 上次打开的项目绝对路径（None 表示从未选过项目）；快捷访问不会更新它
+        self.last_project_path = None
 
     def _get_default_quick_access_paths(self):
         """获取默认快捷访问路径"""
@@ -1772,6 +1776,8 @@ class MainWindow(QMainWindow):
                 self.splitter_sizes = config_data['splitter_sizes']
             if 'window_maximized' in config_data:
                 self.window_maximized = bool(config_data['window_maximized'])
+            if 'last_project_path' in config_data:
+                self.last_project_path = config_data['last_project_path']
         except Exception:
             self._init_default_settings()
         return self.project_paths
@@ -1833,6 +1839,7 @@ class MainWindow(QMainWindow):
             config_data['window_geometry'] = getattr(self, 'window_geometry', None)
             config_data['splitter_sizes'] = getattr(self, 'splitter_sizes', None)
             config_data['window_maximized'] = bool(getattr(self, 'window_maximized', False))
+            config_data['last_project_path'] = getattr(self, 'last_project_path', None)
             if hasattr(self, 'folder_structure'):
                 config_data['folder_structure'] = self.folder_structure
             if default_new_project_folder:
@@ -2424,7 +2431,42 @@ class MainWindow(QMainWindow):
         if self.pinned_folders:
             self._apply_pin_order(self.motherboard_table)
             self._apply_pin_order(self.daughterboard_table)
-    
+
+        # 首次扫描完成后尝试恢复上次打开的项目（仅一次，刷新不再触发）
+        self._restore_last_project()
+
+    def _restore_last_project(self):
+        """扫描完成后恢复上次打开的项目。仅在首次扫描、且用户未抢先手动选行时执行。
+        路径不存在或命名不再符合 S/M 格式则清掉脏数据；表里找不到（被隐藏/根路径配置变了）则静默保留。"""
+        target = getattr(self, '_pending_restore_project', None)
+        self._pending_restore_project = None
+        if not target:
+            return
+        # 用户在扫描期间已手动选了别的行 → 不抢用户选择
+        if getattr(self, 'current_folder', None) is not None:
+            return
+        try:
+            if not os.path.isdir(target):
+                self.last_project_path = None
+                return
+            name = os.path.basename(target)
+            match = PROJECT_FOLDER_RE.match(name)
+            if not match:
+                self.last_project_path = None
+                return
+            table = self.motherboard_table if match.group(1) == 'S' else self.daughterboard_table
+            for row in range(table.rowCount()):
+                if table.item(row, 0).data(Qt.UserRole) == target:
+                    table.selectRow(row)
+                    table.scrollToItem(table.item(row, 0))
+                    self._select_project_path(target)
+                    # 恢复也视作一次"选中"，刷新 last_project_path 保持一致
+                    self.last_project_path = target
+                    return
+            # 表里没找到（被隐藏 / 根路径配置变了 / 未被扫到）：静默，不清字段
+        except Exception:
+            pass
+
     def load_filtered_folders(self):
         """同步加载过滤后的文件夹（保留接口兼容）"""
         self.load_filtered_folders_async()
@@ -2488,6 +2530,9 @@ class MainWindow(QMainWindow):
                 self._reset_preview()
                 self.metadata_tab.clear()
                 self.new_structure_btn.setEnabled(False)
+            # 同步清空「上次项目」记录，避免下次恢复指向已隐藏/删除的项目
+            if getattr(self, 'last_project_path', None) == folder_path:
+                self.last_project_path = None
             self.save_settings_to_file(self.settings, self.include_subfolders)
             self.load_filtered_folders()
 
@@ -2553,17 +2598,26 @@ class MainWindow(QMainWindow):
                 table.item(row, 0).setFont(font)
                 table.item(row, 1).setFont(font)
 
+    def _select_project_path(self, folder_path):
+        """把某个项目路径设为当前：刷新右侧 file_tree、清预览、启用「新建结构」按钮、更新状态栏。
+        供点击项目行与启动恢复共用，避免两份同步漂移。路径不存在则静默跳过。"""
+        if not (folder_path and os.path.exists(folder_path)):
+            return
+        self.current_folder = folder_path
+        self.file_model.setRootPath(folder_path)
+        self.file_tree.setRootIndex(self.file_model.index(folder_path))
+        self._reset_preview()
+        self.metadata_tab.clear()
+        self.new_structure_btn.setEnabled(True)
+        self._update_folder_status_bar()
+
     def on_folder_cell_clicked(self, row, column):
         table = self.sender()
         folder_path = table.item(row, 0).data(Qt.UserRole)
         if folder_path and os.path.exists(folder_path):
-            self.current_folder = folder_path
-            self.file_model.setRootPath(folder_path)
-            self.file_tree.setRootIndex(self.file_model.index(folder_path))
-            self._reset_preview()
-            self.metadata_tab.clear()
-            self.new_structure_btn.setEnabled(True)
-            self._update_folder_status_bar()
+            self._select_project_path(folder_path)
+            # 仅点击项目行才更新「上次项目」；快捷访问不走这里
+            self.last_project_path = folder_path
     
     def on_folder_cell_double_clicked(self, row, column):
         """双击表格项：根据列执行不同操作"""
@@ -2800,6 +2854,9 @@ class MainWindow(QMainWindow):
                 self.file_model.setRootPath(new_path)
                 self.file_tree.setRootIndex(self.file_model.index(new_path))
                 self._update_folder_status_bar()
+            # 同步更新「上次项目」记录，避免下次启动恢复指向旧名字
+            if getattr(self, 'last_project_path', None) == file_path:
+                self.last_project_path = new_path
         except Exception as e:
             QMessageBox.warning(self, "错误", f"重命名失败: {str(e)}")
     
