@@ -84,6 +84,75 @@ class NewProjectDefaultsTests(unittest.TestCase):
         )
 
 
+class PersistedPathTests(unittest.TestCase):
+    def test_slash_variants_share_a_windows_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            backslash = main._normalize_persisted_path(root)
+            slash = backslash.replace('\\', '/')
+            self.assertEqual(main._path_identity(backslash), main._path_identity(slash))
+            self.assertTrue(main._same_path(backslash, slash))
+
+    def test_persisted_path_lists_keep_first_duplicate(self):
+        with tempfile.TemporaryDirectory() as root:
+            slash = root.replace('\\', '/')
+            self.assertEqual(
+                main._normalize_named_paths([('首次名称', root), ('重复名称', slash)]),
+                [('首次名称', main._normalize_persisted_path(root))],
+            )
+            self.assertEqual(
+                main._normalize_quick_access_paths([('首次', root, True), ('重复', slash, False)]),
+                [('首次', main._normalize_persisted_path(root), True)],
+            )
+
+    def test_comment_keys_are_normalized_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as root:
+            slash = root.replace('\\', '/')
+            comments = main._normalize_comments_map({root: '首次注释', slash: '重复注释'})
+            self.assertEqual(comments, {main._normalize_persisted_path(root): '首次注释'})
+
+
+class PreviewResourceTests(unittest.TestCase):
+    def test_pdf_preview_closes_its_file_stream(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'sample.pdf')
+            with open(path, 'wb') as stream:
+                stream.write(b'%PDF-1.4\n')
+            reader_factory = mock.Mock(return_value=SimpleNamespace(pages=[]))
+            window = SimpleNamespace(preview_tab=mock.Mock())
+            with mock.patch.object(main, 'PdfReader', reader_factory):
+                main.MainWindow._preview_pdf(window, path)
+            self.assertTrue(reader_factory.call_args.args[0].closed)
+
+    def test_excel_preview_closes_workbook(self):
+        workbook = mock.Mock(sheetnames=[])
+        window = SimpleNamespace(preview_tab=mock.Mock())
+        with mock.patch.object(main, 'load_workbook', return_value=workbook):
+            main.MainWindow._preview_excel(window, 'sample.xlsx', '.xlsx')
+        workbook.close.assert_called_once_with()
+
+    def test_xls_preview_releases_resources(self):
+        workbook = mock.Mock(nsheets=0)
+        fake_xlrd = mock.Mock(open_workbook=mock.Mock(return_value=workbook))
+        window = SimpleNamespace(preview_tab=mock.Mock())
+        with mock.patch.object(main, 'xlrd', fake_xlrd):
+            main.MainWindow._preview_excel(window, 'sample.xls', '.xls')
+        workbook.release_resources.assert_called_once_with()
+
+    def test_settings_dialog_default_path_area_fits_four_rows(self):
+        app = main.QApplication.instance() or main.QApplication([])
+        dialog = main.SettingsDialog([])
+        expected = (
+            dialog.path_list.horizontalHeader().height()
+            + dialog.path_list.verticalHeader().defaultSectionSize() * 4
+            + dialog.path_list.frameWidth() * 2
+        )
+        self.assertGreaterEqual(dialog.width(), 620)
+        self.assertGreaterEqual(dialog.height(), 540)
+        self.assertGreaterEqual(dialog.path_list.minimumHeight(), expected)
+        dialog.deleteLater()
+        app.processEvents()
+
+
 class TerminalSafetyTests(unittest.TestCase):
     def test_local_paths_are_not_embedded_in_powershell_or_cmd_commands(self):
         path = os.path.abspath(os.path.join(TEST_TMP_ROOT or os.getcwd(), "x'$(calc)&^% space"))

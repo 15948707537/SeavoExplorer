@@ -1,12 +1,8 @@
 # SeavoExplorer 主板项目文件浏览器
 
-**版本 0.5.1**
+**版本 0.5.2**
 
-Windows 单文件版可从 [v0.5.1 Release](https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.5.1) 下载。发布页同时提供独立 SHA-256 文件和 build manifest；下载后应核对附件中的哈希。
-
-```text
-126134AF93E31344768B847760B25FFE56F24C966AC36EE5216003D51B661937
-```
+Windows 单文件版可从 [v0.5.2 Release](https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.5.2) 下载。发布页同时提供独立 SHA-256 文件和 build manifest；下载后应核对附件中的哈希。
 
 ---
 
@@ -57,6 +53,13 @@ SeavoExplorer 是一个 Windows 桌面工具，用于浏览以 S/M 编号命名�
 #### 🆕 显示隐藏文件
 
 菜单 **设置 → 显示隐藏文件**（可勾选开关），或 **设置 → 项目文件夹设置** 中勾选。勾选后在文件树中显示以 `.` 开头的文件（如 `.gitignore`）和系统隐藏属性的文件。
+
+#### 🆕 路径与预览可靠性（0.5.2）
+
+- 项目根、快捷访问、置顶/隐藏项目、上次项目和注释路径会统一规范化；正反斜杠、大小写或尾部分隔符不同的同一路径不会重复保存或重复扫描
+- 旧配置会在正常保存时自动迁移为统一路径格式
+- PDF、Excel、Word 和视频预览完成后会释放读取资源；重命名、归档或移入回收站前会清理当前预览，避免文件被 SeavoExplorer 占用
+- 「项目文件夹设置」默认窗口更大，路径表格至少显示四行
 
 #### 保存版本
 
@@ -154,7 +157,7 @@ python -m venv .venv-build
 .\.venv-build\Scripts\python.exe -m pip install -r requirements-build.txt
 ```
 
-两个包装器都使用同一个权威配置 `main.spec`，默认离线执行版本/资源检查、Python 3.8 grammar、`py_compile`、57 项回归测试、PyInstaller 构建、二进制来源审计和净化环境下的隔离启动冒烟；不会自动安装依赖或重生成图标。
+两个包装器都使用同一个权威配置 `main.spec`，默认离线执行版本/资源检查、Python 3.8 grammar、`py_compile`、64 项回归测试、PyInstaller 构建、二进制来源审计和净化环境下的隔离启动冒烟；不会自动安装依赖或重生成图标。
 
 ### 单文件 exe
 
@@ -192,7 +195,7 @@ python -m py_compile main.py test_safety.py test_tooling.py build_support.py bui
 git diff --check
 ```
 
-当前共 57 项 unittest：`test_safety.py` 的 34 项覆盖产品安全关键路径，`test_tooling.py` 的 23 项覆盖版本/哈希、严格构建环境、manifest、本地资产快照、onedir 完整遍历、环境净化、二进制来源及 GitHub 发布状态校验；它们不等同于完整 GUI 人工验收。
+当前共 64 项 unittest：`test_safety.py` 的 41 项覆盖产品安全关键路径，`test_tooling.py` 的 23 项覆盖版本/哈希、严格构建环境、manifest、本地资产快照、onedir 完整遍历、环境净化、二进制来源及 GitHub 发布状态校验；它们不等同于完整 GUI 人工验收。
 
 ---
 

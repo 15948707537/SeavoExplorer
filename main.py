@@ -74,7 +74,7 @@ def _is_regex_safe(pattern):
             return False, 'recursion limit'
     return True, ''
 
-APP_VERSION = '0.5.1'
+APP_VERSION = '0.5.2'
 GITHUB_REPO_URL = 'https://github.com/FengBujue0104/SeavoExplorer/'
 GITHUB_RELEASES_URL = 'https://github.com/FengBujue0104/SeavoExplorer/releases'
 GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/FengBujue0104/SeavoExplorer/releases/latest'
@@ -86,6 +86,98 @@ def _get_app_dir():
     if hasattr(sys, '_MEIPASS'):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _normalize_persisted_path(path):
+    """规范化写入配置的 Windows 路径；不要求目标当前存在。"""
+    if not isinstance(path, str) or not path:
+        return ''
+    expanded = os.path.expandvars(os.path.expanduser(path))
+    return os.path.normpath(os.path.abspath(expanded)).replace('/', '\\')
+
+
+def _path_identity(path):
+    """返回用于 Windows 路径比较和去重的大小写不敏感键。"""
+    normalized = _normalize_persisted_path(path)
+    return os.path.normcase(normalized) if normalized else ''
+
+
+def _same_path(left, right):
+    return bool(_path_identity(left)) and _path_identity(left) == _path_identity(right)
+
+
+def _path_in_list(paths, path):
+    key = _path_identity(path)
+    return bool(key) and any(_path_identity(item) == key for item in paths)
+
+
+def _get_path_mapping_value(mapping, path, default=None):
+    key = _path_identity(path)
+    if not key:
+        return default
+    for stored_path, value in mapping.items():
+        if _path_identity(stored_path) == key:
+            return value
+    return default
+
+
+def _normalize_named_paths(paths):
+    """规范化 (名称, 路径) 项并稳定去重，保留首次出现的显示名。"""
+    result = []
+    seen = set()
+    for item in paths if isinstance(paths, (list, tuple)) else []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        path = _normalize_persisted_path(item[1])
+        key = _path_identity(path)
+        if not path or key in seen:
+            continue
+        seen.add(key)
+        result.append((str(item[0]), path))
+    return result
+
+
+def _normalize_quick_access_paths(paths):
+    """规范化 (名称, 路径, 不预览) 快捷访问项并稳定去重。"""
+    result = []
+    seen = set()
+    for item in paths if isinstance(paths, (list, tuple)) else []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        path = _normalize_persisted_path(item[1])
+        key = _path_identity(path)
+        if not path or key in seen:
+            continue
+        seen.add(key)
+        no_preview = bool(item[2]) if len(item) > 2 else False
+        result.append((str(item[0]), path, no_preview))
+    return result
+
+
+def _normalize_path_list(paths):
+    """规范化单一路径列表并稳定去重。"""
+    result = []
+    seen = set()
+    for path in paths if isinstance(paths, (list, tuple)) else []:
+        normalized = _normalize_persisted_path(path)
+        key = _path_identity(normalized)
+        if normalized and key not in seen:
+            seen.add(key)
+            result.append(normalized)
+    return result
+
+
+def _normalize_comments_map(comments):
+    """规范化注释键；斜杠形式不同的重复键保留第一次出现的注释。"""
+    result = {}
+    seen = set()
+    for path, comment in comments.items() if isinstance(comments, dict) else []:
+        normalized = _normalize_persisted_path(path)
+        key = _path_identity(normalized)
+        if normalized and key not in seen:
+            seen.add(key)
+            result[normalized] = comment
+    return result
 
 
 def _decode_zip_name(raw):
@@ -1371,12 +1463,12 @@ class FolderScanThread(QThread):
                     if mb_match:
                         number = mb_match.group(1)
                         folder_comment = mb_match.group(2) if mb_match.group(2) else ''
-                        internal_comment = self.comments.get(item_path, folder_comment)
+                        internal_comment = _get_path_mapping_value(self.comments, item_path, folder_comment)
                         motherboard_folders.append((int(number), item_path, number, internal_comment, dir_name))
                     if db_match:
                         number = db_match.group(1)
                         folder_comment = db_match.group(2) if db_match.group(2) else ''
-                        internal_comment = self.comments.get(item_path, folder_comment)
+                        internal_comment = _get_path_mapping_value(self.comments, item_path, folder_comment)
                         daughterboard_folders.append((int(number), item_path, number, internal_comment, dir_name))
                     if self.include_subfolders:
                         self._scan_directory(item_path, dir_name, motherboard_folders, daughterboard_folders)
@@ -1397,6 +1489,18 @@ class FolderScanThread(QThread):
             self._scan_directory(root_dir, dir_name, motherboard_folders, daughterboard_folders)
         if self.isInterruptionRequested():
             return
+        # 根目录重叠或旧配置中的斜杠形式不同，都不能让同一项目重复出现。
+        def dedupe_folders(folders):
+            seen = set()
+            result = []
+            for folder in folders:
+                key = _path_identity(folder[1])
+                if key and key not in seen:
+                    seen.add(key)
+                    result.append(folder)
+            return result
+        motherboard_folders = dedupe_folders(motherboard_folders)
+        daughterboard_folders = dedupe_folders(daughterboard_folders)
         if self.sort_by_number:
             motherboard_folders.sort(key=lambda x: x[0])
             daughterboard_folders.sort(key=lambda x: x[0])
@@ -1607,6 +1711,7 @@ class NewProjectDialog(QDialog):
         folder_path = QFileDialog.getExistingDirectory(self, '选择目标文件夹', self.target_folder)
         if not folder_path:
             return
+        folder_path = _normalize_persisted_path(folder_path)
         self.target_folder = folder_path
         self.folder_label.setText(folder_path)
         if not self.parent_window:
@@ -1614,7 +1719,7 @@ class NewProjectDialog(QDialog):
         self.parent_window.default_new_project_folder = folder_path
         settings = getattr(self.parent_window, 'settings', None) or []
         for name, path in settings:
-            if path == folder_path:
+            if _same_path(path, folder_path):
                 return
         folder_name = os.path.basename(folder_path) or "自定义路径"
         settings.append((folder_name, folder_path))
@@ -1950,7 +2055,8 @@ class SettingsDialog(_ReorderableTableDialog):
         self.custom_mb_regex = custom_mb_regex
         self.custom_db_regex = custom_db_regex
         self.setWindowTitle('项目文件夹设置')
-        self.setGeometry(300, 300, 550, 450)
+        self.setMinimumSize(620, 540)
+        self.resize(720, 600)
         
         layout = QVBoxLayout()
         
@@ -1958,6 +2064,12 @@ class SettingsDialog(_ReorderableTableDialog):
         self.path_list.setHorizontalHeaderLabels(['名称', '路径'])
         self.path_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.path_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        minimum_rows_height = (
+            self.path_list.horizontalHeader().height()
+            + self.path_list.verticalHeader().defaultSectionSize() * 4
+            + self.path_list.frameWidth() * 2
+        )
+        self.path_list.setMinimumHeight(minimum_rows_height)
         for name, path in self.current_paths:
             row = self.path_list.rowCount()
             self.path_list.insertRow(row)
@@ -2039,7 +2151,7 @@ class SettingsDialog(_ReorderableTableDialog):
         save_btn.clicked.connect(self.save_settings)
         
         layout.addWidget(QLabel('项目文件路径（可调整顺序）：'))
-        layout.addWidget(self.path_list)
+        layout.addWidget(self.path_list, 1)
         layout.addLayout(button_layout)
         layout.addLayout(sort_layout)
         layout.addWidget(self.include_subfolders_checkbox)
@@ -2118,6 +2230,7 @@ class SettingsDialog(_ReorderableTableDialog):
             path_item = self.path_list.item(row, 1)
             if name_item and path_item:
                 paths.append((name_item.text(), path_item.text()))
+        paths = _normalize_named_paths(paths)
         if not paths:
             QMessageBox.warning(self, '警告', '至少需要保留一个项目文件夹')
             return
@@ -2909,25 +3022,25 @@ class MainWindow(QMainWindow):
             if 'project_paths' in config_data and config_data['project_paths']:
                 if not isinstance(config_data['project_paths'], list):
                     raise TypeError('project_paths 类型错误')
-                self.project_paths = config_data['project_paths']
+                self.project_paths = _normalize_named_paths(config_data['project_paths'])
             if 'include_subfolders' in config_data:
                 self.include_subfolders = config_data['include_subfolders']
             if 'sort_by_number' in config_data:
                 self.sort_by_number = config_data['sort_by_number']
             if 'default_new_project_folder' in config_data:
-                self.default_new_project_folder = config_data['default_new_project_folder']
+                self.default_new_project_folder = _normalize_persisted_path(config_data['default_new_project_folder'])
             if 'folder_structure' in config_data:
                 self.folder_structure = config_data['folder_structure']
             if 'archive_tool_path' in config_data:
-                self.archive_tool_path = config_data['archive_tool_path']
+                self.archive_tool_path = _normalize_persisted_path(config_data['archive_tool_path'])
             enable_7zip = config_data.get('enable_7zip', False)
             self.enable_7zip = enable_7zip if isinstance(enable_7zip, bool) else False
             if 'quick_access_paths' in config_data:
-                self.quick_access_paths = config_data['quick_access_paths']
+                self.quick_access_paths = _normalize_quick_access_paths(config_data['quick_access_paths'])
             if 'pinned_folders' in config_data:
-                self.pinned_folders = config_data['pinned_folders']
+                self.pinned_folders = _normalize_path_list(config_data['pinned_folders'])
             if 'hidden_folders' in config_data:
-                self.hidden_folders = config_data['hidden_folders']
+                self.hidden_folders = _normalize_path_list(config_data['hidden_folders'])
             if 'wizard_shown' in config_data:
                 self.wizard_shown = config_data['wizard_shown']
             if 'show_hidden' in config_data:
@@ -2946,7 +3059,7 @@ class MainWindow(QMainWindow):
             if 'window_maximized' in config_data:
                 self.window_maximized = bool(config_data['window_maximized'])
             if 'last_project_path' in config_data:
-                self.last_project_path = config_data['last_project_path']
+                self.last_project_path = _normalize_persisted_path(config_data['last_project_path']) or None
         except Exception:
             self._init_default_settings()
         return self.project_paths
@@ -2992,8 +3105,18 @@ class MainWindow(QMainWindow):
 
     def save_settings_to_file(self, paths, include_subfolders=False, default_new_project_folder=None):
         try:
+            normalized_paths = _normalize_named_paths(paths)
+            self.quick_access_paths = _normalize_quick_access_paths(getattr(self, 'quick_access_paths', []))
+            self.pinned_folders = _normalize_path_list(getattr(self, 'pinned_folders', []))
+            self.hidden_folders = _normalize_path_list(getattr(self, 'hidden_folders', []))
+            self.archive_tool_path = _normalize_persisted_path(getattr(self, 'archive_tool_path', ''))
+            self.last_project_path = _normalize_persisted_path(getattr(self, 'last_project_path', '')) or None
+            if default_new_project_folder:
+                self.default_new_project_folder = _normalize_persisted_path(default_new_project_folder)
+            elif hasattr(self, 'default_new_project_folder'):
+                self.default_new_project_folder = _normalize_persisted_path(self.default_new_project_folder)
             config_data = {
-                'project_paths': paths,
+                'project_paths': normalized_paths,
                 'include_subfolders': include_subfolders,
                 'sort_by_number': getattr(self, 'sort_by_number', False),
                 'archive_tool_path': getattr(self, 'archive_tool_path', ''),
@@ -3016,9 +3139,7 @@ class MainWindow(QMainWindow):
             config_data['last_project_path'] = getattr(self, 'last_project_path', None)
             if hasattr(self, 'folder_structure'):
                 config_data['folder_structure'] = self.folder_structure
-            if default_new_project_folder:
-                config_data['default_new_project_folder'] = default_new_project_folder
-            elif hasattr(self, 'default_new_project_folder'):
+            if hasattr(self, 'default_new_project_folder') and self.default_new_project_folder:
                 config_data['default_new_project_folder'] = self.default_new_project_folder
             else:
                 config_data['default_new_project_folder'] = os.path.expanduser('~')
@@ -3055,7 +3176,7 @@ class MainWindow(QMainWindow):
             return {}
         try:
             with open(self.COMMENTS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                return _normalize_comments_map(json.load(f))
         except (json.JSONDecodeError, ValueError):
             # 文件损坏：备份而非静默返回 {}（否则下次保存会用空字典永久覆盖所有注释）
             bak = self._backup_corrupt_file(self.COMMENTS_FILE)
@@ -3067,6 +3188,7 @@ class MainWindow(QMainWindow):
 
     def save_comments(self):
         """保存项目注释"""
+        self.comments = _normalize_comments_map(self.comments)
         if self.safe_write_json(self.COMMENTS_FILE, self.comments):
             return True
         else:
@@ -3251,7 +3373,7 @@ class MainWindow(QMainWindow):
 
     def _open_quick_access_external(self, path):
         try:
-            path = os.path.normpath(path)
+            path = _normalize_persisted_path(path)
             if os.path.exists(path):
                 os.startfile(path)
             else:
@@ -3261,6 +3383,7 @@ class MainWindow(QMainWindow):
     
     def _open_quick_access_path(self, path):
         # os.path.exists() 对 UNC/网络路径不可靠,直接尝试加载;失败时 QFileSystemModel 不会显示内容
+        path = _normalize_persisted_path(path)
         self.current_folder = path
         self.file_model.setRootPath(path)
         self.file_tree.setRootIndex(self.file_model.index(path))
@@ -3281,7 +3404,7 @@ class MainWindow(QMainWindow):
         seen = set()
         for index in selection_model.selectedRows(0):
             file_path = self.file_model.filePath(index)
-            normalized_path = os.path.normpath(file_path)
+            normalized_path = _path_identity(file_path)
             if os.path.exists(file_path) and normalized_path not in seen:
                 seen.add(normalized_path)
                 paths.append(file_path)
@@ -3315,7 +3438,7 @@ class MainWindow(QMainWindow):
         valid_paths = []
         seen = set()
         for file_path in file_paths:
-            normalized_path = os.path.normpath(file_path)
+            normalized_path = _path_identity(file_path)
             if os.path.exists(file_path) and normalized_path not in seen:
                 seen.add(normalized_path)
                 valid_paths.append(file_path)
@@ -3408,11 +3531,15 @@ class MainWindow(QMainWindow):
                 zf.write(file_path, arcname)
 
     def _move_paths_to_recycle(self, file_paths):
+        # 文件预览可能刚读取过目标；在所有删除入口先释放 GUI 侧引用和待执行预览。
+        reset_preview = getattr(self, '_reset_preview', None)
+        if callable(reset_preview):
+            reset_preview()
         valid_paths = []
         seen = set()
         for file_path in file_paths:
             absolute_path = os.path.abspath(file_path)
-            normalized_path = os.path.normcase(os.path.normpath(absolute_path))
+            normalized_path = _path_identity(absolute_path)
             if os.path.exists(absolute_path) and normalized_path not in seen:
                 seen.add(normalized_path)
                 valid_paths.append(absolute_path)
@@ -3512,7 +3639,7 @@ class MainWindow(QMainWindow):
     def _remove_quick_access_item(self, item_data):
         """删除一个快捷访问项，按名称、路径和预览模式精确匹配。"""
         target_name, target_path, target_no_preview = item_data
-        target_path = os.path.normcase(os.path.normpath(target_path))
+        target_path = _path_identity(target_path)
         kept_paths = []
         removed = False
         for item in self.quick_access_paths:
@@ -3521,7 +3648,7 @@ class MainWindow(QMainWindow):
             else:
                 name, path = item
                 no_preview = False
-            item_path = os.path.normcase(os.path.normpath(path))
+            item_path = _path_identity(path)
             if (
                 not removed
                 and name == target_name
@@ -3706,8 +3833,8 @@ class MainWindow(QMainWindow):
         self.daughterboard_table.setRowCount(0)
         self.filtered_folders = {'主板': [], '子卡': []}
         
-        visible_motherboard_folders = [folder for folder in motherboard_folders if folder[1] not in self.hidden_folders]
-        visible_daughterboard_folders = [folder for folder in daughterboard_folders if folder[1] not in self.hidden_folders]
+        visible_motherboard_folders = [folder for folder in motherboard_folders if not _path_in_list(self.hidden_folders, folder[1])]
+        visible_daughterboard_folders = [folder for folder in daughterboard_folders if not _path_in_list(self.hidden_folders, folder[1])]
 
         # 填充主板表格
         for folder in visible_motherboard_folders:
@@ -3767,7 +3894,7 @@ class MainWindow(QMainWindow):
                 return
             table = self.motherboard_table if match.group(1) == 'S' else self.daughterboard_table
             for row in range(table.rowCount()):
-                if table.item(row, 0).data(Qt.UserRole) == target:
+                if _same_path(table.item(row, 0).data(Qt.UserRole), target):
                     table.selectRow(row)
                     table.scrollToItem(table.item(row, 0))
                     self._select_project_path(target)
@@ -3808,8 +3935,9 @@ class MainWindow(QMainWindow):
             self.daughterboard_table.setRowHidden(row, not show)
     
     def _get_effective_folder_comment(self, folder_path):
-        if folder_path in self.comments:
-            return self.comments[folder_path]
+        comment = _get_path_mapping_value(self.comments, folder_path)
+        if comment is not None:
+            return comment
         folder_name = os.path.basename(folder_path)
         match = self.folder_regex_mb.match(folder_name) or self.folder_regex_db.match(folder_name)
         if match:
@@ -3824,7 +3952,7 @@ class MainWindow(QMainWindow):
         if not folder_path:
             return
         menu = QMenu(self)
-        if folder_path in self.pinned_folders:
+        if _path_in_list(self.pinned_folders, folder_path):
             pin_action = menu.addAction('取消置顶')
         else:
             pin_action = menu.addAction('置顶')
@@ -3834,20 +3962,20 @@ class MainWindow(QMainWindow):
         action_pos = table.viewport().mapToGlobal(pos)
         chosen = menu.exec_(action_pos)
         if chosen == pin_action:
-            if folder_path in self.pinned_folders:
-                self.pinned_folders.remove(folder_path)
+            if _path_in_list(self.pinned_folders, folder_path):
+                self.pinned_folders = [path for path in self.pinned_folders if not _same_path(path, folder_path)]
             else:
-                self.pinned_folders.append(folder_path)
+                self.pinned_folders.append(_normalize_persisted_path(folder_path))
             self._apply_pin_order(table)
             self.save_settings_to_file(self.settings, self.include_subfolders)
         elif chosen == terminal_action:
             self.open_folder_in_terminal(folder_path)
         elif chosen == hide_action:
-            if folder_path not in self.hidden_folders:
-                self.hidden_folders.append(folder_path)
-            if folder_path in self.pinned_folders:
-                self.pinned_folders.remove(folder_path)
-            if folder_path == self.current_folder:
+            if not _path_in_list(self.hidden_folders, folder_path):
+                self.hidden_folders.append(_normalize_persisted_path(folder_path))
+            if _path_in_list(self.pinned_folders, folder_path):
+                self.pinned_folders = [path for path in self.pinned_folders if not _same_path(path, folder_path)]
+            if _same_path(folder_path, self.current_folder):
                 self.current_folder = None
                 self.file_model.setRootPath('')
                 self.file_tree.setRootIndex(QModelIndex())
@@ -3867,7 +3995,7 @@ class MainWindow(QMainWindow):
                     stats_t.requestInterruption()
                     stats_t.quit()
             # 同步清空「上次项目」记录，避免下次恢复指向已隐藏/删除的项目
-            if getattr(self, 'last_project_path', None) == folder_path:
+            if _same_path(getattr(self, 'last_project_path', None), folder_path):
                 self.last_project_path = None
             self.save_settings_to_file(self.settings, self.include_subfolders)
             self.load_filtered_folders()
@@ -3891,7 +4019,7 @@ class MainWindow(QMainWindow):
 
         index = labels.index(label)
         restored_path = hidden_folders[index]
-        self.hidden_folders.remove(restored_path)
+        self.hidden_folders = [path for path in self.hidden_folders if not _same_path(path, restored_path)]
         self.save_settings_to_file(self.settings, self.include_subfolders)
         self.load_filtered_folders()
         self.locate_new_folder(restored_path)
@@ -3902,11 +4030,17 @@ class MainWindow(QMainWindow):
         normal_rows = []
         for row in range(table.rowCount()):
             folder_path = table.item(row, 0).data(Qt.UserRole)
-            if folder_path in self.pinned_folders:
+            if _path_in_list(self.pinned_folders, folder_path):
                 pinned_rows.append(row)
             else:
                 normal_rows.append(row)
-        pinned_rows.sort(key=lambda r: self.pinned_folders.index(table.item(r, 0).data(Qt.UserRole)), reverse=True)
+        pinned_rows.sort(
+            key=lambda r: next(
+                index for index, path in enumerate(self.pinned_folders)
+                if _same_path(path, table.item(r, 0).data(Qt.UserRole))
+            ),
+            reverse=True,
+        )
         new_order = pinned_rows + normal_rows
         items_data = []
         for row in range(table.rowCount()):
@@ -3925,7 +4059,7 @@ class MainWindow(QMainWindow):
         for row in range(table.rowCount()):
             folder_path = table.item(row, 0).data(Qt.UserRole)
             font = table.item(row, 0).font()
-            if folder_path in self.pinned_folders:
+            if _path_in_list(self.pinned_folders, folder_path):
                 font.setBold(True)
                 table.item(row, 0).setFont(font)
                 table.item(row, 1).setFont(font)
@@ -4300,7 +4434,7 @@ class MainWindow(QMainWindow):
         elif column == 1:  # 双击注释列：修改注释
             # 优先编辑当前界面显示的有效注释：JSON 覆盖值优先，否则使用文件夹名后缀
             current_comment = self._get_effective_folder_comment(folder_path)
-            stored_comment = self.comments.get(folder_path)
+            stored_comment = _get_path_mapping_value(self.comments, folder_path)
 
             # 弹出对话框编辑注释
             folder_name = os.path.basename(folder_path)
@@ -4309,10 +4443,17 @@ class MainWindow(QMainWindow):
                 new_comment = dialog.get_comment()
                 if new_comment != stored_comment:
                     if new_comment:
-                        self.comments[folder_path] = new_comment
+                        self.comments = {
+                            path: comment for path, comment in self.comments.items()
+                            if not _same_path(path, folder_path)
+                        }
+                        self.comments[_normalize_persisted_path(folder_path)] = new_comment
                     else:
                         # 如果注释为空，从存储中删除，界面会回退显示文件夹名后缀注释
-                        self.comments.pop(folder_path, None)
+                        self.comments = {
+                            path: comment for path, comment in self.comments.items()
+                            if not _same_path(path, folder_path)
+                        }
                     # 保存注释
                     self.save_comments()
                     # 刷新文件夹列表
@@ -4585,24 +4726,30 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, '警告', f'名称 "{new_name}" 已存在')
                 return
             
+            self._reset_preview()
             os.rename(file_path, new_path)
             self.statusBar().showMessage(f"已重命名: {old_name} -> {new_name}")
 
             settings_changed = False
-            if file_path in self.comments:
-                self.comments[new_path] = self.comments.pop(file_path)
+            old_comment = _get_path_mapping_value(self.comments, file_path)
+            if old_comment is not None:
+                self.comments = {
+                    path: comment for path, comment in self.comments.items()
+                    if not _same_path(path, file_path)
+                }
+                self.comments[_normalize_persisted_path(new_path)] = old_comment
                 self.save_comments()
-            if file_path in self.pinned_folders:
-                self.pinned_folders = [new_path if path == file_path else path for path in self.pinned_folders]
+            if _path_in_list(self.pinned_folders, file_path):
+                self.pinned_folders = [new_path if _same_path(path, file_path) else path for path in self.pinned_folders]
                 settings_changed = True
-            if file_path in self.hidden_folders:
-                self.hidden_folders = [new_path if path == file_path else path for path in self.hidden_folders]
+            if _path_in_list(self.hidden_folders, file_path):
+                self.hidden_folders = [new_path if _same_path(path, file_path) else path for path in self.hidden_folders]
                 settings_changed = True
             if settings_changed:
                 self.save_settings_to_file(self.settings, self.include_subfolders)
 
             # 如果重命名的是当前项目文件夹，更新current_folder
-            if file_path == self.current_folder:
+            if _same_path(file_path, self.current_folder):
                 self.current_folder = new_path
                 self.file_model.setRootPath(new_path)
                 self.file_tree.setRootIndex(self.file_model.index(new_path))
@@ -4611,7 +4758,7 @@ class MainWindow(QMainWindow):
                 self._breadcrumb_path = new_path
                 self._rebuild_breadcrumb()
             # 同步更新「上次项目」记录，避免下次启动恢复指向旧名字
-            if getattr(self, 'last_project_path', None) == file_path:
+            if _same_path(getattr(self, 'last_project_path', None), file_path):
                 self.last_project_path = new_path
         except Exception as e:
             QMessageBox.warning(self, "错误", f"重命名失败: {str(e)}")
@@ -4858,6 +5005,7 @@ class MainWindow(QMainWindow):
         try:
             if not file_paths:
                 return
+            self._reset_preview()
             moved = 0
             for file_path in file_paths:
                 if not os.path.exists(file_path):
@@ -5034,7 +5182,7 @@ class MainWindow(QMainWindow):
             return
             for row in range(table.rowCount()):
                 row_path = table.item(row, 0).data(Qt.UserRole)
-                if row_path == folder_path:
+                if _same_path(row_path, folder_path):
                     table.selectRow(row)
                     table.scrollToItem(table.item(row, 0))
                     self.current_folder = folder_path
@@ -5114,10 +5262,12 @@ class MainWindow(QMainWindow):
             return
         content = f'PDF文件: {os.path.basename(file_path)}\n\n'
         try:
-            reader = PdfReader(file_path)
-            content += f'页数: {len(reader.pages)}\n\n'
-            for i, page in enumerate(reader.pages[:PREVIEW_PDF_PAGES]):
-                content += f'第 {i+1} 页:\n{page.extract_text()}\n\n'
+            # PyPDF2 接收路径时可能延后关闭文件；显式管理流可避免 Windows 锁定源文件。
+            with open(file_path, 'rb') as stream:
+                reader = PdfReader(stream)
+                content += f'页数: {len(reader.pages)}\n\n'
+                for i, page in enumerate(reader.pages[:PREVIEW_PDF_PAGES]):
+                    content += f'第 {i+1} 页:\n{page.extract_text()}\n\n'
         except Exception as e:
             content += f'PDF读取错误: {str(e)}'
         self.preview_tab.setPlainText(content)
@@ -5285,6 +5435,7 @@ class MainWindow(QMainWindow):
                 return
             content = (f'Excel宏文件: {os.path.basename(file_path)}\n\n' if is_macro
                        else f'Excel文件: {os.path.basename(file_path)}\n\n')
+            workbook = None
             try:
                 workbook = load_workbook(file_path, read_only=True, keep_vba=is_macro)
                 for sheet_name in workbook.sheetnames:
@@ -5295,12 +5446,19 @@ class MainWindow(QMainWindow):
                     content += '\n'
             except Exception as e:
                 content += (f'Excel宏文件读取错误: {str(e)}' if is_macro else f'Excel读取错误: {str(e)}')
+            finally:
+                if workbook is not None:
+                    try:
+                        workbook.close()
+                    except Exception:
+                        pass
             self.preview_tab.setPlainText(content)
         elif ext == '.xls':
             if not xlrd:
                 self.preview_tab.setPlainText('Excel 97-2003文件预览功能需要安装xlrd库')
                 return
             content = f'Excel文件(97-2003): {os.path.basename(file_path)}\n\n'
+            workbook = None
             try:
                 workbook = xlrd.open_workbook(file_path)
                 for sheet_idx in range(workbook.nsheets):
@@ -5313,6 +5471,12 @@ class MainWindow(QMainWindow):
                     content += '\n'
             except Exception as e:
                 content += f'Excel读取错误: {str(e)}'
+            finally:
+                if workbook is not None:
+                    try:
+                        workbook.release_resources()
+                    except Exception:
+                        pass
             self.preview_tab.setPlainText(content)
 
     def _preview_word(self, file_path, ext):
@@ -5334,6 +5498,7 @@ class MainWindow(QMainWindow):
                 return
             content = f'Word文件(97-2003): {os.path.basename(file_path)}\n\n'
             ole = None
+            stream = None
             try:
                 ole = olefile.OleFileIO(file_path)
                 if ole.exists('WordDocument'):
@@ -5347,6 +5512,11 @@ class MainWindow(QMainWindow):
                 content += f'Word 97-2003读取错误: {str(e)}'
             finally:
                 # 即使读取异常也要关闭句柄，否则文件被占用无法删除/重命名
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
                 if ole is not None:
                     try:
                         ole.close()
@@ -5422,8 +5592,11 @@ class MainWindow(QMainWindow):
         """恢复预览区域到文本视图并清空，隐藏按钮与图片区域。"""
         self._cancel_pending_preview()
         self._manual_preview_path = None
+        self.current_image_path = None
+        self.current_video_path = None
         self.preview_button.hide()
         self.image_scroll_area.hide()
+        self.image_label.clear()
         self.preview_tab.show()
         self.preview_tab.clear()
 
@@ -5796,11 +5969,10 @@ class MainWindow(QMainWindow):
         about_text = (
             '<h3>SeavoExplorer - 主板项目文件浏览器</h3>'
             f'<p>版本 {APP_VERSION}</p>'
-            '<p>本版本新增文件版本管理（保存版本）、归档到old文件夹；'
-            '修复F5刷新文件树不更新、右键重命名失效等bug；'
-            '视频预览支持 5 帧截图(10%/30%/50%/70%/90%)并可在查看器中逐帧切换；'
-            '预览大图支持滚轮缩放、按钮缩放、鼠标拖拽平移；视频预览默认关闭(需手动开启)；'
-            '修复文件搜索结果分组与双击定位、快捷访问双击打开资源管理器、窗口最大化记忆等。</p>'
+            '<p>本版本统一规范化保存的 Windows 路径，自动识别正反斜杠、大小写和尾部分隔符不同的同一路径，'
+            '避免项目、快捷访问及项目状态重复；预览 PDF、Excel、Word、视频后会主动释放资源，'
+            '重命名、归档和移入回收站前也会清理预览，减少文件被程序占用的问题。'
+            '“项目文件夹设置”窗口默认显示更大的路径列表，无需手动拉伸即可查看多条路径。</p>'
             f'<p>GitHub：<a href="{GITHUB_REPO_URL}">{GITHUB_REPO_URL}</a></p>'
         )
         # 关于页 logo 优先用高清 PNG 源（清晰放大），回退到多尺寸 ico
@@ -6222,6 +6394,7 @@ class MainWindow(QMainWindow):
         """保留:单个视频缩略图(中点帧),向后兼容。"""
         if not HAS_OPENCV:
             return None
+        cap = None
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -6230,11 +6403,10 @@ class MainWindow(QMainWindow):
             frame_to_capture = total_frames // 2
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_to_capture)
             ret, frame = cap.read()
-            cap.release()
             if not ret:
+                cap.release()
                 cap = cv2.VideoCapture(video_path)
                 ret, frame = cap.read()
-                cap.release()
                 if not ret:
                     return None
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -6243,6 +6415,12 @@ class MainWindow(QMainWindow):
             return q_image.copy()
         except Exception:
             return None
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
     
     def keyPressEvent(self, event):
         # 输入控件（搜索框、编辑框）获得焦点时，不拦截 Ctrl+C/V/Delete 等编辑快捷键
