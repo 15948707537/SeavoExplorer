@@ -153,6 +153,111 @@ class PreviewResourceTests(unittest.TestCase):
         app.processEvents()
 
 
+class SaveFileVersionTests(unittest.TestCase):
+    def _save_version_with_files(self, filenames):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, 'board.dsn')
+            with open(source, 'w', encoding='utf-8') as stream:
+                stream.write('source')
+            for filename in filenames:
+                with open(os.path.join(root, filename), 'w', encoding='utf-8') as stream:
+                    stream.write(filename)
+            status = mock.Mock()
+            window = SimpleNamespace(statusBar=lambda: status)
+            main.MainWindow.save_file_version(window, source)
+            messages = status.showMessage.call_args_list
+            self.assertTrue(messages)
+            return messages[-1].args[0], set(os.listdir(root))
+
+    def test_only_c_version_continues_with_d(self):
+        today = time.strftime('%Y%m%d')
+        message, filenames = self._save_version_with_files([f'board_{today}c.dsn'])
+        self.assertIn(f'board_{today}d.dsn', message)
+        self.assertIn(f'board_{today}d.dsn', filenames)
+        self.assertNotIn(f'board_{today}.dsn', filenames)
+        self.assertNotIn(f'board_{today}a.dsn', filenames)
+        self.assertNotIn(f'board_{today}b.dsn', filenames)
+
+    def test_non_contiguous_versions_continue_after_maximum(self):
+        today = time.strftime('%Y%m%d')
+        message, filenames = self._save_version_with_files([
+            f'board_{today}.dsn',
+            f'board_{today}b.dsn',
+            f'board_{today}d.dsn',
+        ])
+        self.assertIn(f'board_{today}e.dsn', message)
+        self.assertIn(f'board_{today}e.dsn', filenames)
+        self.assertNotIn(f'board_{today}a.dsn', filenames)
+        self.assertNotIn(f'board_{today}c.dsn', filenames)
+
+
+class ExternalClipboardTests(unittest.TestCase):
+    def test_local_urls_from_system_clipboard_are_paste_sources(self):
+        with tempfile.TemporaryDirectory() as root:
+            source_file = os.path.join(root, 'external.txt')
+            source_dir = os.path.join(root, 'external-folder')
+            with open(source_file, 'w', encoding='utf-8') as stream:
+                stream.write('external')
+            os.makedirs(source_dir)
+            mime_data = SimpleNamespace(
+                hasUrls=lambda: True,
+                urls=lambda: [
+                    main.QUrl.fromLocalFile(source_file),
+                    main.QUrl.fromLocalFile(source_dir),
+                    main.QUrl('https://example.invalid/ignored.txt'),
+                ],
+            )
+            clipboard = SimpleNamespace(mimeData=lambda: mime_data)
+            window = SimpleNamespace(clipboard_paths=[], clipboard_path=None)
+            with mock.patch.object(main.QApplication, 'clipboard', return_value=clipboard):
+                sources = main.MainWindow._get_clipboard_source_paths(window)
+            self.assertEqual(sources, [source_file, source_dir])
+
+    def test_system_clipboard_takes_precedence_over_stale_internal_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            external = os.path.join(root, 'external.txt')
+            internal = os.path.join(root, 'internal.txt')
+            for path in (external, internal):
+                with open(path, 'w', encoding='utf-8') as stream:
+                    stream.write(path)
+            mime_data = SimpleNamespace(
+                hasUrls=lambda: True,
+                urls=lambda: [main.QUrl.fromLocalFile(external)],
+            )
+            clipboard = SimpleNamespace(mimeData=lambda: mime_data)
+            window = SimpleNamespace(clipboard_paths=[internal], clipboard_path=internal)
+            with mock.patch.object(main.QApplication, 'clipboard', return_value=clipboard):
+                sources = main.MainWindow._get_clipboard_source_paths(window)
+            self.assertEqual(sources, [external])
+
+
+class BreadcrumbNavigationTests(unittest.TestCase):
+    def test_double_click_opens_root_or_child_without_tree_navigation(self):
+        with tempfile.TemporaryDirectory() as root:
+            child = os.path.join(root, 'child')
+            os.makedirs(child)
+            opened = mock.Mock()
+            window = SimpleNamespace(
+                current_folder=root,
+                _open_with_shell=opened,
+                _rebuild_breadcrumb=mock.Mock(),
+            )
+            main.MainWindow._on_breadcrumb_double_clicked(window, root)
+            main.MainWindow._on_breadcrumb_double_clicked(window, child)
+            self.assertEqual(opened.call_args_list, [mock.call(root), mock.call(child)])
+
+    def test_double_click_rejects_directory_outside_current_project(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            opened = mock.Mock()
+            window = SimpleNamespace(
+                current_folder=root,
+                _open_with_shell=opened,
+                _rebuild_breadcrumb=mock.Mock(),
+            )
+            main.MainWindow._on_breadcrumb_double_clicked(window, outside)
+            opened.assert_not_called()
+
+
 class TerminalSafetyTests(unittest.TestCase):
     def test_local_paths_are_not_embedded_in_powershell_or_cmd_commands(self):
         path = os.path.abspath(os.path.join(TEST_TMP_ROOT or os.getcwd(), "x'$(calc)&^% space"))

@@ -74,7 +74,7 @@ def _is_regex_safe(pattern):
             return False, 'recursion limit'
     return True, ''
 
-APP_VERSION = '0.5.2'
+APP_VERSION = '0.5.3'
 GITHUB_REPO_URL = 'https://github.com/FengBujue0104/SeavoExplorer/'
 GITHUB_RELEASES_URL = 'https://github.com/FengBujue0104/SeavoExplorer/releases'
 GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/FengBujue0104/SeavoExplorer/releases/latest'
@@ -2505,9 +2505,9 @@ class WizardDialog(QDialog):
             <p>文件树支持按住 <b>Ctrl</b> / <b>Shift</b> 多选，再进行批量操作：</p>
             <ul>
             <li><b>Ctrl+C / 右键复制</b>：复制到剪贴板，可在资源管理器粘贴，也保留程序内“粘贴副本”</li>
-            <li><b>Ctrl+V / 右键粘贴副本</b>：粘贴到选中文件夹或当前项目（自动处理重名）</li>
+            <li><b>Ctrl+V / 右键粘贴副本</b>：可粘贴程序内或资源管理器复制的本地文件/文件夹，自动处理重名</li>
             <li><b>F2 / 右键重命名</b>：重命名单个文件</li>
-            <li><b>右键保存版本</b>：为文件生成日期版本副本（如 S1200-10_20260708.dsn），自动递增字母后缀</li>
+            <li><b>右键保存版本</b>：为文件生成日期版本副本（如 S1200-10_20260708.dsn），按当前最大后缀继续递增</li>
             <li><b>右键归档到old文件夹</b>：将选中文件移入同目录下的 old/ 文件夹（自动创建），支持多选</li>
             <li><b>Delete</b>：移入回收站</li>
             <li>右键还可“添加到 zip 压缩包”“智能解压”</li>
@@ -4124,14 +4124,10 @@ class MainWindow(QMainWindow):
                 self._breadcrumb_layout.insertWidget(insert_at, sep)
                 insert_at += 1
                 self._breadcrumb_buttons.append(sep)
-            is_last = (i == last_idx)
             is_ellipsis = (path is None)
-            if is_last or is_ellipsis:
+            if is_ellipsis:
                 lbl = QLabel(name)
-                if is_last:
-                    lbl.setStyleSheet('font-weight: bold; color: #2c3e50; padding: 0 4px;')
-                else:
-                    lbl.setStyleSheet('color: #999; padding: 0 2px;')
+                lbl.setStyleSheet('color: #999; padding: 0 2px;')
                 self._breadcrumb_layout.insertWidget(insert_at, lbl)
                 insert_at += 1
                 self._breadcrumb_buttons.append(lbl)
@@ -4140,11 +4136,38 @@ class MainWindow(QMainWindow):
                 btn.setText(name)
                 btn.setAutoRaise(True)
                 btn.setCursor(Qt.PointingHandCursor)
-                btn.setStyleSheet(
-                    'QToolButton { border: none; color: #2575c0; padding: 0 4px; }'
-                    'QToolButton:hover { color: #1a4d80; text-decoration: underline; }'
-                )
-                btn.clicked.connect(lambda checked, p=path: self._on_breadcrumb_clicked(p))
+                if i == last_idx:
+                    btn.setStyleSheet(
+                        'QToolButton { border: none; font-weight: bold; color: #2c3e50; padding: 0 4px; }'
+                        'QToolButton:hover { color: #1a4d80; text-decoration: underline; }'
+                    )
+                else:
+                    btn.setStyleSheet(
+                        'QToolButton { border: none; color: #2575c0; padding: 0 4px; }'
+                        'QToolButton:hover { color: #1a4d80; text-decoration: underline; }'
+                    )
+                single_shot = QTimer(btn)
+                single_shot.setSingleShot(True)
+                single_shot.setInterval(250)
+                single_shot.timeout.connect(lambda p=path: self._on_breadcrumb_clicked(p))
+                click_state = {'suppress_single': False}
+
+                def _on_single_click(checked, timer=single_shot, state=click_state):
+                    if state['suppress_single']:
+                        state['suppress_single'] = False
+                        return
+                    timer.start()
+
+                btn.clicked.connect(_on_single_click)
+
+                def _on_double_click(event, p=path, timer=single_shot, button=btn, state=click_state):
+                    state['suppress_single'] = True
+                    if timer.isActive():
+                        timer.stop()
+                    self._on_breadcrumb_double_clicked(p)
+                    QToolButton.mouseDoubleClickEvent(button, event)
+
+                btn.mouseDoubleClickEvent = _on_double_click
                 self._breadcrumb_layout.insertWidget(insert_at, btn)
                 insert_at += 1
                 self._breadcrumb_buttons.append(btn)
@@ -4170,6 +4193,20 @@ class MainWindow(QMainWindow):
         self._reset_preview()
         self._breadcrumb_path = path
         self._rebuild_breadcrumb()
+
+    def _on_breadcrumb_double_clicked(self, path):
+        """双击面包屑目录：直接在 Windows 资源管理器中打开，不切换文件树。"""
+        root = getattr(self, 'current_folder', None)
+        if not (root and path and os.path.isdir(path)):
+            self._rebuild_breadcrumb()
+            return
+        try:
+            rel = os.path.relpath(path, root)
+        except (ValueError, TypeError):
+            return
+        if rel == '..' or rel.startswith('..' + os.sep):
+            return
+        self._open_with_shell(path)
 
     # ---- 文件搜索（文件名 + 类型 + 日期）----
 
@@ -4590,16 +4627,40 @@ class MainWindow(QMainWindow):
     
     def _has_pasteable_clipboard(self):
         """剪贴板中是否有可粘贴的有效路径"""
-        for p in (self.clipboard_paths or []):
-            if os.path.exists(p):
-                return True
-        return bool(self.clipboard_path) and os.path.exists(self.clipboard_path)
+        return bool(self._get_clipboard_source_paths())
+
+    def _get_clipboard_source_paths(self):
+        """读取系统剪贴板中的本地文件/文件夹 URL，并兼容程序内部路径缓存。"""
+        try:
+            mime_data = QApplication.clipboard().mimeData()
+        except Exception:
+            mime_data = None
+
+        if mime_data is not None and mime_data.hasUrls():
+            paths = []
+            seen = set()
+            for url in mime_data.urls():
+                if not url.isLocalFile():
+                    continue
+                path = _normalize_persisted_path(url.toLocalFile())
+                key = _path_identity(path)
+                if path and key not in seen and os.path.exists(path):
+                    seen.add(key)
+                    paths.append(path)
+            return paths
+
+        paths = []
+        seen = set()
+        for path in list(self.clipboard_paths or []) + [self.clipboard_path]:
+            key = _path_identity(path)
+            if path and key not in seen and os.path.exists(path):
+                seen.add(key)
+                paths.append(path)
+        return paths
 
     def paste_copy(self, target_path):
         """粘贴副本到目标路径，支持多选"""
-        sources = [p for p in (self.clipboard_paths or []) if os.path.exists(p)]
-        if not sources and self.clipboard_path and os.path.exists(self.clipboard_path):
-            sources = [self.clipboard_path]
+        sources = self._get_clipboard_source_paths()
         if not sources:
             QMessageBox.warning(self, "警告", "剪贴板中没有有效的文件")
             return
@@ -4667,6 +4728,7 @@ class MainWindow(QMainWindow):
           当天第一个版本 → S1200-10_20260708.dsn
           当天第二个版本 → S1200-10_20260708a.dsn
           当天第三个版本 → S1200-10_20260708b.dsn
+          后续版本始终接在当前最大后缀之后，不回填已缺失的旧后缀
         """
         try:
             if not os.path.isfile(file_path):
@@ -4679,30 +4741,21 @@ class MainWindow(QMainWindow):
             if date_match:
                 base_name = base_name[:date_match.start()]
             today = time.strftime('%Y%m%d')
-            # 查找当天已有的版本
-            existing_suffixes = []
+            # 查找当天已有的版本；版本号只允许无后缀或单个小写字母后缀。
+            # 只取最大后缀的下一个，避免目录中只有 c 时重新生成无后缀/a/b。
+            existing_suffix_ranks = []
+            version_prefix = base_name + '_' + today
             for f in os.listdir(dir_name):
-                if f.startswith(base_name + '_' + today) and f.endswith(ext):
-                    # 提取后缀部分：_YYYYMMDD 之后、.ext 之前
-                    # 对于无扩展名文件(ext='')，直接使用日期后内容
-                    # 提取后缀：_YYYYMMDD 之后的部分
-                    # 注意：当 ext='' 时，f[:-0] 变成 f[:0]='' 导致无法提取后缀
-                    # 所以这里显式处理 ext 为空的情况
-                    suffix_start = len(base_name + '_' + today)
-                    if ext:
-                        middle = f[suffix_start:-len(ext)]
-                    else:
-                        middle = f[suffix_start:]
-                    if middle == '' or (len(middle) == 1 and middle.isalpha()):
-                        existing_suffixes.append(middle)
-            # 确定下一个后缀：'' → a → b → c → ...
-            all_suffixes = set(existing_suffixes)
-            candidate = ''
-            if candidate in all_suffixes:
-                candidate = 'a'
-                while candidate in all_suffixes:
-                    candidate = chr(ord(candidate) + 1)
-            next_suffix = candidate
+                stem = os.path.splitext(f)[0]
+                if not f.endswith(ext) or not stem.startswith(version_prefix):
+                    continue
+                suffix = stem[len(version_prefix):]
+                if suffix == '':
+                    existing_suffix_ranks.append(0)
+                elif re.fullmatch(r'[a-z]', suffix):
+                    existing_suffix_ranks.append(ord(suffix) - ord('a') + 1)
+            next_rank = max(existing_suffix_ranks, default=-1) + 1
+            next_suffix = '' if next_rank == 0 else chr(ord('a') + next_rank - 1)
             new_name = f'{base_name}_{today}{next_suffix}{ext}'
             new_path = os.path.join(dir_name, new_name)
             shutil.copy2(file_path, new_path)
@@ -5969,10 +6022,9 @@ class MainWindow(QMainWindow):
         about_text = (
             '<h3>SeavoExplorer - 主板项目文件浏览器</h3>'
             f'<p>版本 {APP_VERSION}</p>'
-            '<p>本版本统一规范化保存的 Windows 路径，自动识别正反斜杠、大小写和尾部分隔符不同的同一路径，'
-            '避免项目、快捷访问及项目状态重复；预览 PDF、Excel、Word、视频后会主动释放资源，'
-            '重命名、归档和移入回收站前也会清理预览，减少文件被程序占用的问题。'
-            '“项目文件夹设置”窗口默认显示更大的路径列表，无需手动拉伸即可查看多条路径。</p>'
+            '<p>本版本修复保存版本的后缀递增规则，目录中已有 c 版本时会继续生成 d，'
+            '不会回填无后缀、a 或 b 版本；支持从 Windows 资源管理器复制文件/文件夹后，'
+            '直接在程序内粘贴副本；面包屑导航栏支持双击任意目录段直接用资源管理器打开。</p>'
             f'<p>GitHub：<a href="{GITHUB_REPO_URL}">{GITHUB_REPO_URL}</a></p>'
         )
         # 关于页 logo 优先用高清 PNG 源（清晰放大），回退到多尺寸 ico
@@ -6072,9 +6124,9 @@ class MainWindow(QMainWindow):
 <p>选中<b>单个</b>文件/文件夹时：</p>
 <ul>
 <li><b>复制</b>：复制到剪贴板，既可在资源管理器中粘贴，也可用程序内"粘贴副本"</li>
-<li><b>粘贴副本</b>：把剪贴板中的内容复制到当前位置，自动处理重名（追加 <code>_副本N</code>）</li>
+<li><b>粘贴副本</b>：把程序内或资源管理器剪贴板中的本地文件/文件夹复制到当前位置，自动处理重名（追加 <code>_副本N</code>）</li>
 <li><b>重命名</b>：重命名文件或文件夹（也可按 <b>F2</b>）</li>
-<li><b>保存版本</b>：为文件生成日期版本副本（如 <code>S1200-10_20260708.dsn</code>），当天多次保存自动递增字母后缀（a/b/c...）</li>
+<li><b>保存版本</b>：为文件生成日期版本副本（如 <code>S1200-10_20260708.dsn</code>），当天多次保存按当前最大后缀继续递增（a/b/c...），不会回填缺失的旧后缀</li>
 <li><b>归档到old文件夹</b>：将文件移入同目录下的 <code>old/</code> 文件夹（自动创建），支持多选</li>
 <li><b>显示隐藏文件</b>：菜单 <b>设置 → 显示隐藏文件</b>（可勾选开关），勾选后在文件树中显示以 <code>.</code> 开头的文件和系统隐藏属性的文件</li>
 <li><b>添加到zip压缩包</b>：压缩为同名 <code>.zip</code> 文件</li>
@@ -6146,7 +6198,7 @@ class MainWindow(QMainWindow):
 
 <h3 style="color: #2980b9;">七、界面与导航</h3>
 <ul>
-<li><b>面包屑路径栏</b>：文件树上方显示从项目根到当前点选项的路径（如 <code>S1234 › V01 › BOM</code>）。点击中间任意一段，可在文件树中快速选中并定位到该文件夹；路径过长时中间会自动省略。</li>
+<li><b>面包屑路径栏</b>：文件树上方显示从项目根到当前点选项的路径（如 <code>S1234 › V01 › BOM</code>）。单击任意目录段可在文件树中定位，双击任意目录段可直接用资源管理器打开该目录；路径过长时中间会自动省略。</li>
 <li><b>状态栏文件统计</b>：选中项目后，状态栏右侧常驻显示该项目递归的<b>文件数与总大小</b>，在后台计算不卡界面；切换项目会自动更新。</li>
 <li><b>记住窗口与项目</b>：退出时记住窗口大小/位置、左右分栏宽度、是否最大化，以及上次打开的项目；下次启动自动恢复。若上次项目已被删除/改名/隐藏，则安全跳过不报错。</li>
 <li><b>全屏已禁用</b>：本程序不支持全屏模式（避免菜单与关闭按钮不可见），按 F11 等不会进入全屏。</li>
