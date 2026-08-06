@@ -191,7 +191,7 @@ def _is_regex_safe(pattern):
         return False, 'nested alternation'
     return True, ''
 
-APP_VERSION = '0.5.3'
+APP_VERSION = '0.5.4'
 GITHUB_REPO_URL = 'https://github.com/FengBujue0104/SeavoExplorer/'
 GITHUB_RELEASES_URL = 'https://github.com/FengBujue0104/SeavoExplorer/releases'
 GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/FengBujue0104/SeavoExplorer/releases/latest'
@@ -6570,9 +6570,10 @@ class MainWindow(QMainWindow):
         about_text = (
             '<h3>SeavoExplorer - 主板项目文件浏览器</h3>'
             f'<p>版本 {APP_VERSION}</p>'
-            '<p>本版本修复保存版本的后缀递增规则，目录中已有 c 版本时会继续生成 d，'
-            '不会回填无后缀、a 或 b 版本；支持从 Windows 资源管理器复制文件/文件夹后，'
-            '直接在程序内粘贴副本；面包屑导航栏支持双击任意目录段直接用资源管理器打开。</p>'
+            '<p>本版本重点修复稳定性与数据安全问题：扫描大目录/网络盘或下载中关闭窗口不再崩溃；'
+            '保存版本不再静默覆盖（a-z 用完后自动续接 aa-zz）；配置损坏自动备份并提示；'
+            '自定义正则增加契约与灾难性回溯（ReDoS）校验；下载支持断点续传与 SHA-256 完整性校验；'
+            '并改进视频预览、重命名校验、窗口恢复、检查更新等使用体验。</p>'
             f'<p>GitHub：<a href="{GITHUB_REPO_URL}">{GITHUB_REPO_URL}</a></p>'
         )
         # 关于页 logo 优先用高清 PNG 源（清晰放大），回退到多尺寸 ico
@@ -6631,7 +6632,7 @@ class MainWindow(QMainWindow):
 <li>点击 <b>帮助 → 检查更新</b>，程序会读取 GitHub Releases 上的最新版本并与当前版本比较。</li>
 <li>发现新版本时，弹窗会显示版本号、更新文件大小和发布页链接，可选择 <b>下载更新</b> 或 <b>浏览器打开</b>。</li>
 <li>程序内下载会在后台进行，进度窗口显示下载量、速度和预计剩余时间；网络中断时会自动重试，已有临时文件时会尽量断点续传。</li>
-<li>取消时会保留 <code>.part</code> 临时文件以便稍后续传；下载最终失败后会清理临时文件，避免长期占用磁盘。</li>
+<li>取消或网络失败时会保留 <code>.part</code> 临时文件以便稍后续传（失败提示会说明）；下载内容校验失败时会清理临时文件。</li>
 <li>如果 GitHub 连接较慢或下载失败，可使用弹窗中的发布页链接，在浏览器中手动下载最新 <code>SeavoExplorer.exe</code>。</li>
 </ul>
 
@@ -6674,7 +6675,7 @@ class MainWindow(QMainWindow):
 <li><b>复制</b>：复制到剪贴板，既可在资源管理器中粘贴，也可用程序内"粘贴副本"</li>
 <li><b>粘贴副本</b>：把程序内或资源管理器剪贴板中的本地文件/文件夹复制到当前位置，自动处理重名（追加 <code>_副本N</code>）</li>
 <li><b>重命名</b>：重命名文件或文件夹（也可按 <b>F2</b>）</li>
-<li><b>保存版本</b>：为文件生成日期版本副本（如 <code>S1200-10_20260708.dsn</code>），当天多次保存按当前最大后缀继续递增（a/b/c...），不会回填缺失的旧后缀</li>
+<li><b>保存版本</b>：为文件生成日期版本副本（如 <code>S1200-10_20260708.dsn</code>），当天多次保存按当前最大后缀继续递增（a/b/c...，字母用完后自动续接 aa/ab/...），不会回填缺失的旧后缀，也不会覆盖已有版本</li>
 <li><b>归档到old文件夹</b>：将文件移入同目录下的 <code>old/</code> 文件夹（自动创建），支持多选</li>
 <li><b>显示隐藏文件</b>：菜单 <b>设置 → 显示隐藏文件</b>（可勾选开关），勾选后在文件树中显示以 <code>.</code> 开头的文件和系统隐藏属性的文件</li>
 <li><b>添加到zip压缩包</b>：压缩为同名 <code>.zip</code> 文件</li>
