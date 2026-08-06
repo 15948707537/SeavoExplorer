@@ -150,6 +150,16 @@ def _validate_windows_filename(name):
         return f'"{stem}" 是 Windows 保留名称，请更换名称'
     return None
 
+def _coerce_bool(value, default=False):
+    """把持久化的布尔设置归一化为 bool：真布尔原样；字符串按 true/1/yes/on 解析；其余回退默认。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return default
+
 def _is_regex_safe(pattern):
     """检测正则是否有 ReDoS（灾难性回溯）风险。"""
     import time
@@ -242,7 +252,7 @@ def _normalize_quick_access_paths(paths):
         if not path or key in seen:
             continue
         seen.add(key)
-        no_preview = bool(item[2]) if len(item) > 2 else False
+        no_preview = _coerce_bool(item[2]) if len(item) > 2 else False
         result.append((str(item[0]), path, no_preview))
     return result
 
@@ -1640,6 +1650,29 @@ class VideoFrameThread(QThread):
         return images
 
 
+class CheckUpdateThread(QThread):
+    """后台请求 GitHub 最新 Release 信息，避免网络等待阻塞 UI 线程。"""
+    result_ready = pyqtSignal(object)  # release_data dict 或 Exception 实例
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def run(self):
+        try:
+            request = urllib.request.Request(
+                GITHUB_LATEST_RELEASE_API,
+                headers={
+                    'Accept': 'application/vnd.github+json',
+                    'User-Agent': f'SeavoExplorer/{APP_VERSION}',
+                },
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = json.loads(response.read().decode('utf-8'))
+            self.result_ready.emit(data)
+        except Exception as e:
+            self.result_ready.emit(e)
+
+
 class FolderScanThread(QThread):
     """文件夹扫描线程，用于异步加载项目文件夹"""
     scan_completed = pyqtSignal(list, list)  # 发射(主板文件夹列表, 子卡文件夹列表)
@@ -1729,6 +1762,7 @@ class FolderScanThread(QThread):
 class FolderStatsThread(QThread):
     """递归统计某文件夹的文件数与总大小（off UI 线程，避免大目录/网络盘冻结界面）。"""
     stats_ready = pyqtSignal(int, int, int, bool)  # (token, file_count, total_size, truncated)
+    stats_error = pyqtSignal(int, str)  # (token, message) 顶层遍历异常（如 root 失联）
 
     MAX_FILES = 50000  # 软上限：超过即停，UI 显示 50000+
 
@@ -1759,9 +1793,9 @@ class FolderStatsThread(QThread):
                         break
                 if truncated:
                     break
-        except Exception:
-            # os.walk 顶层异常（root 失联等）：发已累计的部分结果
-            pass
+        except Exception as e:
+            # os.walk 顶层异常（root 失联等）：报告错误，避免误显示为"0 个文件"
+            self.stats_error.emit(self.token, str(e))
         if not self.isInterruptionRequested():
             self.stats_ready.emit(self.token, count, total, truncated)
 
@@ -1769,6 +1803,7 @@ class FolderStatsThread(QThread):
 class FileSearchThread(QThread):
     """在某个文件夹下递归搜索文件：按文件名 + 扩展名 + 修改时间过滤（off UI 线程）。"""
     search_ready = pyqtSignal(int, list, bool)  # (token, results, truncated)
+    search_error = pyqtSignal(int, str)  # (token, message) 顶层遍历异常
 
     MAX_RESULTS = 2000  # 软上限：超过即停，UI 提示
 
@@ -1810,8 +1845,9 @@ class FileSearchThread(QThread):
                         break
                 if truncated:
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            # os.walk 顶层异常（root 失联等）：报告错误，避免误显示为"未找到匹配文件"
+            self.search_error.emit(self.token, str(e))
         if not self.isInterruptionRequested():
             self.search_ready.emit(self.token, results, truncated)
 
@@ -3269,9 +3305,9 @@ class MainWindow(QMainWindow):
                     raise TypeError('project_paths 类型错误')
                 self.project_paths = _normalize_named_paths(config_data['project_paths'])
             if 'include_subfolders' in config_data:
-                self.include_subfolders = config_data['include_subfolders']
+                self.include_subfolders = _coerce_bool(config_data['include_subfolders'])
             if 'sort_by_number' in config_data:
-                self.sort_by_number = config_data['sort_by_number']
+                self.sort_by_number = _coerce_bool(config_data['sort_by_number'])
             if 'default_new_project_folder' in config_data:
                 self.default_new_project_folder = _normalize_persisted_path(config_data['default_new_project_folder'])
             if 'folder_structure' in config_data:
@@ -3287,9 +3323,9 @@ class MainWindow(QMainWindow):
             if 'hidden_folders' in config_data:
                 self.hidden_folders = _normalize_path_list(config_data['hidden_folders'])
             if 'wizard_shown' in config_data:
-                self.wizard_shown = config_data['wizard_shown']
+                self.wizard_shown = _coerce_bool(config_data['wizard_shown'])
             if 'show_hidden' in config_data:
-                self.show_hidden = config_data['show_hidden']
+                self.show_hidden = _coerce_bool(config_data['show_hidden'])
             self.regex_state = config_data.get('regex_state', 'default')
             custom_mb = config_data.get('custom_mb_regex')
             self.custom_mb_regex = custom_mb if isinstance(custom_mb, str) else ''
@@ -3298,13 +3334,14 @@ class MainWindow(QMainWindow):
             for key, _name in PREVIEW_CATEGORIES:
                 cfg_key = f'preview_{key}_enabled'
                 if cfg_key in config_data:
-                    setattr(self, cfg_key, config_data[cfg_key])
+                    default = False if key == 'video' else True
+                    setattr(self, cfg_key, _coerce_bool(config_data[cfg_key], default))
             if 'window_geometry' in config_data:
                 self.window_geometry = config_data['window_geometry']
             if 'splitter_sizes' in config_data:
                 self.splitter_sizes = config_data['splitter_sizes']
             if 'window_maximized' in config_data:
-                self.window_maximized = bool(config_data['window_maximized'])
+                self.window_maximized = _coerce_bool(config_data['window_maximized'])
             if 'last_project_path' in config_data:
                 self.last_project_path = _normalize_persisted_path(config_data['last_project_path']) or None
         except Exception:
@@ -4077,12 +4114,13 @@ class MainWindow(QMainWindow):
             self.update_download_thread = None
         # 其余线程统一处理
         _signal_map = {
-            '_stats_thread': ('stats_ready',),
-            '_search_thread': ('search_ready',),
+            '_stats_thread': ('stats_ready', 'stats_error'),
+            '_search_thread': ('search_ready', 'search_error'),
             'scan_thread': ('scan_completed', 'scan_progress'),
             '_video_thumb_thread': ('frames_ready',),
+            '_check_update_thread': ('result_ready',),
         }
-        for attr in ('_stats_thread', '_search_thread', 'scan_thread', '_video_thumb_thread'):
+        for attr in ('_stats_thread', '_search_thread', 'scan_thread', '_video_thumb_thread', '_check_update_thread'):
             t = getattr(self, attr, None)
             if t is not None:
                 try:
@@ -4636,6 +4674,7 @@ class MainWindow(QMainWindow):
             # 先断开信号，避免 wait 超时后旧线程的信号发往已 deleteLater 的对象
             try:
                 old.search_ready.disconnect(self._on_search_ready)
+                old.search_error.disconnect(self._on_search_error)
             except (TypeError, RuntimeError):
                 pass
             self._safe_stop_thread(old, 2000)
@@ -4650,6 +4689,7 @@ class MainWindow(QMainWindow):
         self.search_status_label.setText('搜索中…')
         self._search_thread = FileSearchThread(root, token, name, exts, mtime_after)
         self._search_thread.search_ready.connect(self._on_search_ready)
+        self._search_thread.search_error.connect(self._on_search_error)
         self._search_thread.start()
 
     def _on_search_ready(self, token, results, truncated):
@@ -4735,6 +4775,7 @@ class MainWindow(QMainWindow):
             # 断开信号：让在跑线程的结果静默丢弃，无需改 token 影响后续搜索
             try:
                 t.search_ready.disconnect(self._on_search_ready)
+                t.search_error.disconnect(self._on_search_error)
             except (TypeError, RuntimeError):
                 pass
             self._safe_stop_thread(t, 2000)
@@ -5362,6 +5403,7 @@ class MainWindow(QMainWindow):
         if old is not None:
             try:
                 old.stats_ready.disconnect(self._on_stats_ready)
+                old.stats_error.disconnect(self._on_stats_error)
             except (TypeError, RuntimeError):
                 pass
             self._safe_stop_thread(old, 2000)
@@ -5373,6 +5415,7 @@ class MainWindow(QMainWindow):
         self.folder_stats_label.setText('统计中…')
         self._stats_thread = FolderStatsThread(root, token)
         self._stats_thread.stats_ready.connect(self._on_stats_ready)
+        self._stats_thread.stats_error.connect(self._on_stats_error)
         self._stats_thread.start()
 
     def _on_stats_ready(self, token, count, size, truncated):
@@ -5383,6 +5426,18 @@ class MainWindow(QMainWindow):
             self.folder_stats_label.setText(f'{count}+ 个文件 · ≥{self.format_file_size(size)}')
         else:
             self.folder_stats_label.setText(f'{count} 个文件 · {self.format_file_size(size)}')
+
+    def _on_stats_error(self, token, message):
+        """统计线程顶层遍历异常：明确提示，避免误显示为"0 个文件"。"""
+        if token != self._stats_token:
+            return  # 过期，丢弃
+        self.folder_stats_label.setText(f'统计失败: {message}')
+
+    def _on_search_error(self, token, message):
+        """搜索线程顶层遍历异常：明确提示，避免误显示为"未找到匹配文件"。"""
+        if token != self._search_token:
+            return  # 过期，丢弃
+        self.search_status_label.setText(f'搜索出错: {message}')
 
     def archive_to_old_folder(self, file_paths):
         """将选中文件/文件夹移入各自目录下的 old 文件夹。
@@ -6281,10 +6336,46 @@ class MainWindow(QMainWindow):
                 self.update_download_thread = None
 
     def check_for_updates(self):
-        """检查 GitHub Releases 并可选下载最新 exe。"""
+        """检查 GitHub Releases 并可选下载最新 exe。网络请求在后台线程执行，避免阻塞 UI。"""
         self.statusBar().showMessage('正在检查更新...')
+        old = getattr(self, '_check_update_thread', None)
+        if old is not None and old.isRunning():
+            return  # 已有检查在进行，避免重复触发
+        thread = CheckUpdateThread(self)
+        self._check_update_thread = thread
+        thread.result_ready.connect(self._on_update_check_ready)
+        thread.start()
+
+    def _on_update_check_ready(self, payload):
+        """检查更新线程完成：网络异常或正常数据都在此继续处理（GUI 线程）。"""
+        self._check_update_thread = None
+        if isinstance(payload, Exception):
+            if isinstance(payload, urllib.error.HTTPError):
+                self._ask_open_release_page(
+                    '检查更新失败',
+                    f'GitHub 返回错误：HTTP {payload.code}\n\n发布页：{GITHUB_RELEASES_URL}',
+                    GITHUB_RELEASES_URL,
+                )
+            elif isinstance(payload, urllib.error.URLError):
+                self._ask_open_release_page(
+                    '检查更新失败',
+                    f'无法连接 GitHub。\n原因：{payload.reason}\n\n发布页：{GITHUB_RELEASES_URL}',
+                    GITHUB_RELEASES_URL,
+                )
+            elif isinstance(payload, RuntimeError):
+                message = str(payload)
+                if message:
+                    self._ask_open_release_page(
+                        '下载失败',
+                        f'{message}\n\n发布页：{GITHUB_RELEASES_URL}\n\n可改用浏览器下载。',
+                        GITHUB_RELEASES_URL,
+                    )
+            else:
+                QMessageBox.warning(self, '检查更新失败', f'检查更新时发生错误：\n{str(payload)}')
+            self.statusBar().clearMessage()
+            return
         try:
-            release_data = self._fetch_latest_release()
+            release_data = payload
             tag_name = release_data.get('tag_name') or release_data.get('name') or ''
             latest_version = str(tag_name).lstrip('vV')
             release_url = release_data.get('html_url') or GITHUB_RELEASES_URL
