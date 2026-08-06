@@ -832,6 +832,48 @@ class UpdateDownloadSafetyTests(unittest.TestCase):
             self.assertIn('下载临时文件未能清理', failures[0])
             self.assertIn(thread.part_path, failures[0])
 
+    def test_cancel_during_integrity_check_keeps_partial(self):
+        """下载完成后的 SHA-256 校验阶段被取消：走 canceled 路径且保留 .part（不误报校验失败）。"""
+        class FakeResponse(object):
+            status = 200
+            headers = {'Content-Length': '5'}
+            def __init__(self, data):
+                self._data = data
+                self._pos = 0
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def getcode(self):
+                return 200
+            def read(self, n):
+                if self._pos >= len(self._data):
+                    return b''
+                chunk = self._data[self._pos:self._pos + n]
+                self._pos += len(chunk)
+                return chunk
+
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as root:
+            save_path = os.path.join(root, 'update.exe')
+            thread = main.UpdateDownloadThread('https://example.invalid/update.exe', save_path, expected_size=5, expected_sha256='0' * 64)
+            canceled = []
+            failed = []
+            thread.download_canceled.connect(lambda p, s: canceled.append((p, s)))
+            thread.download_failed.connect(lambda m: failed.append(m))
+            counter = [0]
+            def interrupt_late():
+                # 前几次检查（下载循环/哈希计算）返回 False，校验完成后返回 True
+                counter[0] += 1
+                return counter[0] >= 4
+            with mock.patch.object(thread, 'isInterruptionRequested', side_effect=interrupt_late):
+                with mock.patch('urllib.request.urlopen', return_value=FakeResponse(b'hello')):
+                    result = thread._download_once(1)
+
+            self.assertFalse(result)
+            self.assertEqual(len(canceled), 1)
+            self.assertTrue(os.path.exists(thread.part_path))
+            self.assertEqual(len(failed), 0)
+
 
 class ArchiveSafetyTests(unittest.TestCase):
     def setUp(self):

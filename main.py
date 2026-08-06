@@ -4085,8 +4085,12 @@ class MainWindow(QMainWindow):
         return False
 
     def _retry_close(self):
-        """等待后台线程结束后重试关闭窗口。"""
+        """等待后台线程结束后重试关闭窗口；重试超过上限（约 30 秒）后强制退出，避免窗口永远无法关闭。"""
         self._closing_pending = False
+        self._close_retry_count = getattr(self, '_close_retry_count', 0) + 1
+        if self._close_retry_count > 30:
+            QMessageBox.warning(self, '退出', '后台任务长时间未结束，将强制退出。\n未完成的下载/扫描操作可能丢失。')
+            os._exit(0)
         self.close()
 
     def load_filtered_folders_async(self):
