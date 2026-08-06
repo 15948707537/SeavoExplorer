@@ -1964,28 +1964,13 @@ class NewProjectDialog(QDialog):
         self.create_btn.setEnabled(True)
         
     def select_folder(self, event=None):
-        """选择目标文件夹"""
+        """选择目标文件夹（仅更新对话框状态；默认目录在创建成功后才持久化，取消无副作用）"""
         folder_path = QFileDialog.getExistingDirectory(self, '选择目标文件夹', self.target_folder)
         if not folder_path:
             return
         folder_path = _normalize_persisted_path(folder_path)
         self.target_folder = folder_path
         self.folder_label.setText(folder_path)
-        if not self.parent_window:
-            return
-        self.parent_window.default_new_project_folder = folder_path
-        settings = getattr(self.parent_window, 'settings', None) or []
-        for name, path in settings:
-            if _same_path(path, folder_path):
-                return
-        folder_name = os.path.basename(folder_path) or "自定义路径"
-        settings.append((folder_name, folder_path))
-        self.parent_window.settings = settings
-        self.parent_window.save_settings_to_file(
-            self.parent_window.settings,
-            self.parent_window.include_subfolders,
-            folder_path
-        )
     
     def create_project(self):
         if not re.match(r'^\d{3,4}$', self.pcb_number):
@@ -1996,12 +1981,30 @@ class NewProjectDialog(QDialog):
             folder_name = f'{prefix}{self.pcb_number}_{self.comment}'
         else:
             folder_name = f'{prefix}{self.pcb_number}'
+        # 名称/注释非法字符校验：避免 \ / 创建出嵌套目录、非法字符导致创建失败且无指引
+        name_error = _validate_windows_filename(folder_name)
+        if name_error:
+            QMessageBox.warning(self, '警告', f'无法创建：{name_error}')
+            return
         target_path = os.path.join(self.target_folder, folder_name)
         if os.path.exists(target_path):
             QMessageBox.warning(self, '警告', f'文件夹 {folder_name} 已存在')
             return
         try:
             os.makedirs(target_path)
+            # 仅创建成功才记录默认新建目录并持久化（取消/失败不产生副作用）
+            if self.parent_window:
+                self.parent_window.default_new_project_folder = self.target_folder
+                settings = getattr(self.parent_window, 'settings', None) or []
+                if not any(_same_path(path, self.target_folder) for name, path in settings):
+                    folder_label = os.path.basename(self.target_folder) or "自定义路径"
+                    settings.append((folder_label, self.target_folder))
+                    self.parent_window.settings = settings
+                self.parent_window.save_settings_to_file(
+                    self.parent_window.settings,
+                    self.parent_window.include_subfolders,
+                    self.target_folder
+                )
             QMessageBox.information(self, '成功', f'项目文件夹 {folder_name} 已创建')
             self.accept()
         except Exception as e:
@@ -3379,15 +3382,19 @@ class MainWindow(QMainWindow):
                         ctypes.windll.kernel32.SetFileAttributesW(file_path, 0x80)  # FILE_ATTRIBUTE_NORMAL
                 except Exception:
                     pass
+            # 上次崩溃残留的 .tmp 可能带只读/隐藏属性：先解除再写入，避免保存通道永久卡死
+            if os.path.exists(tmp_path):
+                try:
+                    os.chmod(tmp_path, 0o666)
+                    if sys.platform == 'win32':
+                        ctypes.windll.kernel32.SetFileAttributesW(tmp_path, 0x80)
+                except Exception:
+                    pass
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, file_path)  # 原子替换
-            os.chmod(file_path, 0o644)
-            if make_hidden:
-                self.make_file_hidden(file_path)
-            return True
         except Exception:
             # 清理残留临时文件，避免污染目录
             try:
@@ -3396,6 +3403,14 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             return False
+        # 数据已原子落盘：属性设置（隐藏/权限）失败不影响保存结果，避免误报保存失败
+        try:
+            os.chmod(file_path, 0o644)
+            if make_hidden:
+                self.make_file_hidden(file_path)
+        except Exception:
+            pass
+        return True
 
     def save_settings_to_file(self, paths, include_subfolders=False, default_new_project_folder=None):
         try:
