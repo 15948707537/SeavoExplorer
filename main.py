@@ -3700,7 +3700,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '错误', f'无法打开文件夹: {str(e)}')
     
     def _open_quick_access_path(self, path):
-        # os.path.exists() 对 UNC/网络路径不可靠,直接尝试加载;失败时 QFileSystemModel 不会显示内容
+        # 先做存在性检查：目录被删/网络盘断开时提示而非导航到空白树（UNC 断连时 isdir 快速返回 False）
+        try:
+            if not os.path.isdir(path):
+                self.statusBar().showMessage(f'路径不可用：{path}')
+                return
+        except OSError:
+            self.statusBar().showMessage(f'路径不可用：{path}')
+            return
         path = _normalize_persisted_path(path)
         self.current_folder = path
         self.file_model.setRootPath(path)
@@ -5105,7 +5112,19 @@ class MainWindow(QMainWindow):
         if os.path.isdir(source_path):
             shutil.copytree(source_path, dest)
         else:
-            shutil.copy2(source_path, dest)
+            # 复制到同目录临时文件后改名：os.rename 在 Windows 上目标已存在时抛异常，
+            # 杜绝「检查后、复制前外部进程创建同名文件」被 copy2 静默覆盖的竞态窗口
+            tmp_dest = dest + '.paste-tmp'
+            try:
+                shutil.copy2(source_path, tmp_dest)
+                os.rename(tmp_dest, dest)
+            except OSError:
+                try:
+                    if os.path.exists(tmp_dest):
+                        os.remove(tmp_dest)
+                except OSError:
+                    pass
+                raise
     
     def save_file_version(self, file_path):
         """保存文件版本：生成 文件名_YYYYMMDD[后缀].ext 的副本。
@@ -6186,13 +6205,31 @@ class MainWindow(QMainWindow):
         return f'{minutes:02d}:{sec:02d}'
 
     def _parse_version_tuple(self, version_text):
-        """把 v0.2.3 / 0.2.3 解析为可比较的数字元组。"""
+        """把 v0.2.3 / 0.2.3 / 0.5.3-beta.1 解析为可比较的数字元组。
+
+        主版本段不足 3 段补 0；预发布后缀（-beta.N / -rc.N / +build 等）使版本低于正式版：
+        0.5.3-beta.1 → (0,5,3,-1,1)，0.5.3 → (0,5,3,0)，数字元组比较符合语义。
+        """
         cleaned = str(version_text or '').strip().lstrip('vV')
+        main_part = cleaned
+        pre_part = ''
+        for sep in ('-', '+'):
+            if sep in cleaned:
+                main_part, pre_part = cleaned.split(sep, 1)
+                break
         parts = []
-        for part in cleaned.split('.'):
+        for part in main_part.split('.'):
             match = re.match(r'^(\d+)', part)
             parts.append(int(match.group(1)) if match else 0)
         while len(parts) < 3:
+            parts.append(0)
+        if pre_part:
+            # 预发布/构建后缀：第四段为负（低于正式版的 0），并尽量解析其后缀序号
+            pre_match = re.search(r'(\d+)$', pre_part)
+            pre_num = int(pre_match.group(1)) if pre_match else 0
+            parts.append(-1)
+            parts.append(pre_num)
+        else:
             parts.append(0)
         return tuple(parts)
 
