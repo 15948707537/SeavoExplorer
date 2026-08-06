@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import http.client
+import hashlib
 import urllib.error
 import urllib.request
 from collections import namedtuple
@@ -49,13 +50,85 @@ DEFAULT_MB_RE = re.compile(DEFAULT_MB_RE_TEXT)
 DEFAULT_DB_RE = re.compile(DEFAULT_DB_RE_TEXT)
 
 def _resolve_regex(state, custom_text, default_re):
-    """根据 state 返回 (re.Pattern, is_fallback)。state 为 custom 时尝试编译 custom_text，失败时兜底到默认正则。"""
-    if state == "custom":
+    """根据 state 返回 (re.Pattern, is_fallback)。state 为 custom 时尝试编译 custom_text，失败/为空/类型非法时兜底到默认正则。"""
+    if state == "custom" and isinstance(custom_text, str) and custom_text:
         try:
             return re.compile(custom_text), False
         except re.error:
             return default_re, True
+    if state == "custom":
+        # 自定义模式但内容为空或类型非法：显式回退到默认正则
+        return default_re, True
     return default_re, False
+
+def _validate_project_regex(pattern):
+    """校验自定义项目正则是否满足扫描器契约。
+
+    契约：非空、可编译、至少 1 个捕获组（组 1 为项目编号），且组 1 在代表样本上可转为整数。
+    返回 (ok, error_message)。样本均未匹配时视为窄化规则（如只匹配特定编号段），交由运行时保护兜底。
+    """
+    if not pattern:
+        return False, '正则不能为空'
+    try:
+        compiled = re.compile(pattern)
+    except re.error as e:
+        return False, f'正则无效: {e}'
+    if compiled.groups < 1:
+        return False, '正则至少需要 1 个捕获组（组 1 作为项目编号，如 (\\d{3,4})）'
+    for sample in ('S100', 'M999', 'S1234_注释', 'SABC'):
+        match = compiled.match(sample)
+        if not match:
+            continue
+        try:
+            int(match.group(1))
+        except (IndexError, ValueError, TypeError):
+            return False, f'捕获组 1 必须是纯数字项目编号（样本 "{sample}" 提取到 "{match.group(1)}"）'
+        return True, ''
+    return True, ''
+
+def _extract_project_fields(match):
+    """从项目正则匹配结果提取 (number:int, number_text:str, comment:str)。
+
+    扫描器契约要求组 1 为可转 int 的项目编号、组 2 为可选注释；
+    不满足契约（组缺失/非数字/类型异常）时返回 None，由调用方跳过该条目，
+    避免单个异常中止整个目录的扫描循环。
+    """
+    if match is None:
+        return None
+    try:
+        number_text = match.group(1)
+        number = int(number_text)
+    except (IndexError, ValueError, TypeError):
+        return None
+    try:
+        comment = match.group(2) or ''
+    except (IndexError, TypeError):
+        comment = ''
+    return number, number_text, comment
+
+# 保存版本的最大后缀数量：无后缀(0) + a-z(1-26) + aa-zz(27-702)
+MAX_VERSION_RANKS = 26 + 26 * 26
+
+def _version_suffix_from_rank(rank):
+    """版本后缀 rank → 后缀文本。0 → ''；1-26 → a-z；27-702 → aa-zz；超出返回 None。"""
+    if rank == 0:
+        return ''
+    if rank <= 26:
+        return chr(ord('a') + rank - 1)
+    if rank <= MAX_VERSION_RANKS:
+        n = rank - 27
+        return chr(ord('a') + n // 26) + chr(ord('a') + n % 26)
+    return None
+
+def _version_rank_from_suffix(suffix):
+    """版本后缀文本 → rank。'' → 0；a-z → 1-26；aa-zz → 27-702；无法识别返回 None。"""
+    if suffix == '':
+        return 0
+    if re.fullmatch(r'[a-z]', suffix):
+        return ord(suffix) - ord('a') + 1
+    if re.fullmatch(r'[a-z]{2}', suffix):
+        return 27 + (ord(suffix[0]) - ord('a')) * 26 + (ord(suffix[1]) - ord('a'))
+    return None
 
 def _is_regex_safe(pattern):
     """检测正则是否有 ReDoS（灾难性回溯）风险。"""
@@ -1222,6 +1295,10 @@ class RenameDialog(QDialog):
     def get_new_name(self):
         return self.new_name
 
+class UpdateDownloadIntegrityError(Exception):
+    """下载内容与发布方提供的 SHA-256 摘要不一致（重试无意义，直接失败）。"""
+
+
 class UpdateDownloadThread(QThread):
     """更新文件下载线程，支持临时文件、重试与断点续传。"""
     progress_changed = pyqtSignal(int, int, float, int, bool, int)
@@ -1234,12 +1311,16 @@ class UpdateDownloadThread(QThread):
     DOWNLOAD_TIMEOUT = 90
     MAX_RETRIES = 3
 
-    def __init__(self, url, save_path, expected_size=0, parent=None):
+    def __init__(self, url, save_path, expected_size=0, expected_sha256='', parent=None):
         super().__init__(parent)
         self.url = url
         self.save_path = save_path
         self.expected_size = int(expected_size or 0)
-        self.part_path = save_path + '.part'
+        self.expected_sha256 = (expected_sha256 or '').strip().lower()
+        # 临时文件绑定 URL 指纹：不同 URL 的下载绝不复用同一个 .part，
+        # 避免旧内容与新内容拼接导致的静默损坏（跨版本/资产重传场景）。
+        fingerprint = hashlib.sha256(url.encode('utf-8')).hexdigest()[:12] if isinstance(url, str) and url else 'download'
+        self.part_path = save_path + '.' + fingerprint + '.part'
 
     def _make_request(self, start=0):
         headers = {'User-Agent': f'SeavoExplorer/{APP_VERSION}'}
@@ -1272,6 +1353,22 @@ class UpdateDownloadThread(QThread):
         except OSError as e:
             return e
         return None
+
+    def _sha256_file(self, path):
+        """计算文件 SHA-256；中断时返回已计算的部分摘要（调用方在完成前校验）。"""
+        digest = hashlib.sha256()
+        try:
+            with open(path, 'rb') as stream:
+                while True:
+                    if self.isInterruptionRequested():
+                        break
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as e:
+            raise UpdateDownloadIntegrityError(f'无法读取下载文件进行校验: {e}')
+        return digest.hexdigest()
 
     def _download_once(self, attempt):
         existing = self._partial_size()
@@ -1331,6 +1428,18 @@ class UpdateDownloadThread(QThread):
                     os.chmod(self.save_path, 0o666)
                 except OSError:
                     pass
+            # 内容完整性校验：与发布方 SHA-256 摘要比对（若提供），避免续传拼接/传输损坏交付坏文件
+            if self.expected_sha256:
+                actual_sha256 = self._sha256_file(self.part_path)
+                if self.isInterruptionRequested():
+                    # 校验期间被取消：保留 .part 供续传，走取消路径而非误报校验失败
+                    self.download_canceled.emit(self.part_path, self._partial_size())
+                    return False
+                if actual_sha256 != self.expected_sha256:
+                    self._reset_partial()
+                    raise UpdateDownloadIntegrityError(
+                        f'文件校验失败：期望 SHA-256 {self.expected_sha256[:16]}...，实际 {actual_sha256[:16]}...'
+                    )
             os.replace(self.part_path, self.save_path)
             self.progress_changed.emit(downloaded, total, 0.0, -1, resumed, attempt)
             self.download_completed.emit(self.save_path)
@@ -1352,6 +1461,10 @@ class UpdateDownloadThread(QThread):
                 last_error = e
                 if e.code not in (500, 502, 503, 504) or attempt > self.MAX_RETRIES:
                     break
+            except UpdateDownloadIntegrityError as e:
+                # 内容校验失败：重试无意义（同一 URL 内容不变），直接失败并清理临时文件
+                last_error = e
+                break
             except urllib.error.URLError as e:
                 last_error = e
                 if attempt > self.MAX_RETRIES:
@@ -1461,15 +1574,17 @@ class FolderScanThread(QThread):
                     mb_match = self._mb_regex.match(item)
                     db_match = self._db_regex.match(item)
                     if mb_match:
-                        number = mb_match.group(1)
-                        folder_comment = mb_match.group(2) if mb_match.group(2) else ''
-                        internal_comment = _get_path_mapping_value(self.comments, item_path, folder_comment)
-                        motherboard_folders.append((int(number), item_path, number, internal_comment, dir_name))
+                        fields = _extract_project_fields(mb_match)
+                        if fields is not None:
+                            number, number_text, folder_comment = fields
+                            internal_comment = _get_path_mapping_value(self.comments, item_path, folder_comment)
+                            motherboard_folders.append((number, item_path, number_text, internal_comment, dir_name))
                     if db_match:
-                        number = db_match.group(1)
-                        folder_comment = db_match.group(2) if db_match.group(2) else ''
-                        internal_comment = _get_path_mapping_value(self.comments, item_path, folder_comment)
-                        daughterboard_folders.append((int(number), item_path, number, internal_comment, dir_name))
+                        fields = _extract_project_fields(db_match)
+                        if fields is not None:
+                            number, number_text, folder_comment = fields
+                            internal_comment = _get_path_mapping_value(self.comments, item_path, folder_comment)
+                            daughterboard_folders.append((number, item_path, number_text, internal_comment, dir_name))
                     if self.include_subfolders:
                         self._scan_directory(item_path, dir_name, motherboard_folders, daughterboard_folders)
         except Exception as e:
@@ -2191,20 +2306,14 @@ class SettingsDialog(_ReorderableTableDialog):
         mb_text = self.regex_mb_edit.text().strip()
         db_text = self.regex_db_edit.text().strip()
         errors = []
-        if not mb_text:
-            errors.append('主板正则不能为空')
-        try:
-            re.compile(mb_text)
-        except re.error as e:
-            errors.append(f'主板正则无效: {e}')
-        if not db_text:
-            errors.append('子卡正则不能为空')
-        try:
-            re.compile(db_text)
-        except re.error as e:
-            errors.append(f'子卡正则无效: {e}')
+        mb_ok, mb_error = _validate_project_regex(mb_text)
+        if not mb_ok:
+            errors.append(f'主板正则：{mb_error}')
+        db_ok, db_error = _validate_project_regex(db_text)
+        if not db_ok:
+            errors.append(f'子卡正则：{db_error}')
         if errors:
-            self.regex_status_label.setText('❌ ' + '; '.join(errors) + '（保存后将回退到默认）')
+            self.regex_status_label.setText('❌ ' + '; '.join(errors) + '（保存将被拒绝，请修正或切回默认）')
             self.regex_status_label.setStyleSheet('color: #c0392b;')
         else:
             self.regex_status_label.setText(f'✅ 主板: {mb_text}  |  子卡: {db_text}')
@@ -2239,6 +2348,30 @@ class SettingsDialog(_ReorderableTableDialog):
         self.sort_by_number = self.sort_by_number_checkbox.isChecked()
         self.show_hidden = self.show_hidden_checkbox.isChecked()
         self.regex_state = 'custom' if self.regex_custom_rb.isChecked() else 'default'
+        if self.regex_state == 'custom':
+            mb_ok, mb_error = _validate_project_regex(self.regex_mb_edit.text().strip())
+            db_ok, db_error = _validate_project_regex(self.regex_db_edit.text().strip())
+            problems = []
+            if not mb_ok:
+                problems.append(f'主板正则：{mb_error}')
+            if not db_ok:
+                problems.append(f'子卡正则：{db_error}')
+            if problems:
+                reply = QMessageBox.question(
+                    self,
+                    '正则无效',
+                    '自定义正则不满足要求：\n\n' + '\n'.join(problems) +
+                    '\n\n是否仍然保存？无效的正则将回退为默认规则。',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+                # 用户选择仍然保存：本次会话回退到默认规则（不静默，已明确提示）
+                self.regex_default_rb.blockSignals(True)
+                self.regex_default_rb.setChecked(True)
+                self.regex_default_rb.blockSignals(False)
+                self.regex_state = 'default'
         self.custom_mb_regex = self.regex_mb_edit.text().strip()
         self.custom_db_regex = self.regex_db_edit.text().strip()
         self.accept()
@@ -2626,6 +2759,10 @@ class MainWindow(QMainWindow):
         self.clipboard_paths = []
         self._extract_jobs = {}
         self._close_after_extract_cancel = False
+        # 等待超时仍在运行的线程挂入此列表，finished 后自动清理（绝不销毁运行中的 QThread）
+        self._zombie_threads = []
+        # 关闭重试标志：等待后台线程结束时置 True，防止重复触发重试
+        self._closing_pending = False
 
         self.settings = self.load_settings()
         
@@ -3017,6 +3154,9 @@ class MainWindow(QMainWindow):
             self._init_default_settings()
             return self.project_paths
         except Exception:
+            # 读取阶段 IO 异常（文件被占用/权限不足等）：提示用户，避免误以为配置已加载，
+            # 也避免后续保存静默覆盖原配置而毫无预警
+            self._pending_load_warnings.append('配置文件读取失败，本次会话使用默认设置')
             return self.project_paths
         try:
             if 'project_paths' in config_data and config_data['project_paths']:
@@ -3046,8 +3186,10 @@ class MainWindow(QMainWindow):
             if 'show_hidden' in config_data:
                 self.show_hidden = config_data['show_hidden']
             self.regex_state = config_data.get('regex_state', 'default')
-            self.custom_mb_regex = config_data.get('custom_mb_regex', '')
-            self.custom_db_regex = config_data.get('custom_db_regex', '')
+            custom_mb = config_data.get('custom_mb_regex')
+            self.custom_mb_regex = custom_mb if isinstance(custom_mb, str) else ''
+            custom_db = config_data.get('custom_db_regex')
+            self.custom_db_regex = custom_db if isinstance(custom_db, str) else ''
             for key, _name in PREVIEW_CATEGORIES:
                 cfg_key = f'preview_{key}_enabled'
                 if cfg_key in config_data:
@@ -3061,7 +3203,12 @@ class MainWindow(QMainWindow):
             if 'last_project_path' in config_data:
                 self.last_project_path = _normalize_persisted_path(config_data['last_project_path']) or None
         except Exception:
+            # 配置语义损坏（JSON 语法合法但值类型非法等）：与语法损坏同路径处理——
+            # 备份原文件并提示，避免静默全量重置后下次保存覆盖丢失全部配置
             self._init_default_settings()
+            bak = self._backup_corrupt_file(self.CONFIG_FILE)
+            self._pending_load_warnings.append(
+                '配置文件格式异常，已恢复默认设置' + (f'（原文件备份为 {os.path.basename(bak)}）' if bak else ''))
         return self.project_paths
     
     def make_file_hidden(self, file_path):
@@ -3153,11 +3300,14 @@ class MainWindow(QMainWindow):
             return False
 
     def _backup_corrupt_file(self, file_path):
-        """将损坏的配置/注释文件改名备份为 .bak，避免被下次保存静默覆盖。返回备份路径或 None"""
+        """将损坏的配置/注释文件改名备份为 .bak（旧备份存在时改用时间戳后缀，不覆盖上次备份），
+        避免被下次保存静默覆盖。返回备份路径或 None"""
         try:
             if not os.path.exists(file_path):
                 return None
             bak = file_path + '.bak'
+            if os.path.exists(bak):
+                bak = file_path + '.bak.' + time.strftime('%Y%m%d_%H%M%S')
             try:
                 if sys.platform == 'win32':
                     ctypes.windll.kernel32.SetFileAttributesW(file_path, 0x80)
@@ -3697,6 +3847,59 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, '错误', f'无法打开回收站: {str(e)}')
     
+    def _safe_stop_thread(self, thread, timeout_ms=5000):
+        """安全停止后台线程：请求中断并等待其结束，结束后 deleteLater。
+
+        绝不销毁仍在运行的 QThread（避免 "QThread: Destroyed while thread is still running" 崩溃）：
+        等待超时后挂入 _zombie_threads，待其 finished 信号触发自动清理。
+        返回 True 表示线程已停止（或无需停止），False 表示超时仍在运行。
+        """
+        if thread is None:
+            return True
+        try:
+            running = thread.isRunning()
+        except RuntimeError:
+            return True  # C++ 对象已销毁
+        if not running:
+            try:
+                thread.deleteLater()
+            except RuntimeError:
+                pass
+            return True
+        thread.requestInterruption()
+        thread.quit()
+        if thread.wait(timeout_ms):
+            try:
+                thread.deleteLater()
+            except RuntimeError:
+                pass
+            return True
+        # 超时：线程仍在运行，不得销毁。挂入僵尸列表，等 finished 后自动清理。
+        if thread not in self._zombie_threads:
+            def _cleanup(t=thread):
+                try:
+                    t.deleteLater()
+                except RuntimeError:
+                    pass
+                try:
+                    self._zombie_threads.remove(t)
+                except ValueError:
+                    pass
+            try:
+                thread.finished.connect(_cleanup, Qt.DirectConnection)
+            except RuntimeError:
+                pass
+            self._zombie_threads.append(thread)
+            if not thread.isRunning():
+                # 竞态：connect 之前线程已结束（finished 已发射），立即清理，避免僵尸累积
+                _cleanup()
+        return False
+
+    def _retry_close(self):
+        """等待后台线程结束后重试关闭窗口。"""
+        self._closing_pending = False
+        self.close()
+
     def load_filtered_folders_async(self):
         """异步加载过滤后的文件夹"""
         # 若已有扫描线程在运行，先停止旧线程并断开其信号，避免旧结果回填到新一轮扫描，
@@ -3708,10 +3911,7 @@ class MainWindow(QMainWindow):
                 old.scan_progress.disconnect(self.on_scan_progress)
             except (TypeError, RuntimeError):
                 pass
-            old.requestInterruption()
-            old.quit()
-            old.wait(3000)
-            old.deleteLater()
+            self._safe_stop_thread(old, 3000)
 
         # 清空表格
         self.motherboard_table.setRowCount(0)
@@ -3748,6 +3948,9 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
+        # 收集等待超时仍未结束的线程，稍后统一处理（绝不销毁运行中的 QThread）
+        pending_threads = []
+
         # 下载线程单独处理(结构不同,无 _signal_map 中的信号)
         update_thread = getattr(self, 'update_download_thread', None)
         if update_thread is not None:
@@ -3756,13 +3959,8 @@ class MainWindow(QMainWindow):
                     try: getattr(update_thread, sig).disconnect()
                     except (TypeError, RuntimeError): pass
             except Exception: pass
-            try:
-                if update_thread.isRunning():
-                    update_thread.requestInterruption()
-                    update_thread.quit()
-                    update_thread.wait(5000)
-            except Exception: pass
-            update_thread.deleteLater()
+            if not self._safe_stop_thread(update_thread, 5000):
+                pending_threads.append('下载')
             self.update_download_thread = None
         # 其余线程统一处理
         _signal_map = {
@@ -3779,17 +3977,30 @@ class MainWindow(QMainWindow):
                         if sig is not None:
                             try: sig.disconnect()
                             except (TypeError, RuntimeError): pass
-                    if t.isRunning():
-                        t.requestInterruption()
-                        t.quit()
-                        t.wait(2000)
-                    t.deleteLater()
+                    if not self._safe_stop_thread(t, 2000):
+                        pending_threads.append(attr)
                 except Exception:
                     pass
                 if attr == 'scan_thread':
                     self.scan_thread = None
                 else:
                     setattr(self, attr, None)
+        # 等待超时挂起的僵尸线程也要纳入关闭等待
+        for zombie in list(self._zombie_threads):
+            if zombie is not None:
+                try:
+                    if zombie.isRunning():
+                        pending_threads.append('后台任务')
+                except RuntimeError:
+                    pass
+        if pending_threads:
+            # 仍有线程在运行：不得销毁运行中的 QThread，提示用户并稍后重试关闭
+            if not self._closing_pending:
+                self._closing_pending = True
+                self.statusBar().showMessage('正在等待后台任务结束，完成后将自动退出...')
+                QTimer.singleShot(1000, self._retry_close)
+            event.ignore()
+            return
         # 记住窗口几何/最大化标志/主分栏位置，保存失败绝不阻塞关闭
         try:
             # 最小化时先还原，避免 normalGeometry 未覆盖的极端退化抓到极小化坐标
@@ -3941,7 +4152,10 @@ class MainWindow(QMainWindow):
         folder_name = os.path.basename(folder_path)
         match = self.folder_regex_mb.match(folder_name) or self.folder_regex_db.match(folder_name)
         if match:
-            return match.group(2) if match.group(2) else ''
+            try:
+                return match.group(2) or ''
+            except (IndexError, TypeError):
+                return ''
         return ''
 
     def _show_folder_context_menu(self, table, pos):
@@ -4310,11 +4524,7 @@ class MainWindow(QMainWindow):
                 old.search_ready.disconnect(self._on_search_ready)
             except (TypeError, RuntimeError):
                 pass
-            if old.isRunning():
-                old.requestInterruption()
-                old.quit()
-                old.wait(2000)
-            old.deleteLater()
+            self._safe_stop_thread(old, 2000)
             self._search_thread = None
         name = self.search_name_edit.text()
         exts = self._search_exts_for_combo()
@@ -4413,11 +4623,7 @@ class MainWindow(QMainWindow):
                 t.search_ready.disconnect(self._on_search_ready)
             except (TypeError, RuntimeError):
                 pass
-            if t.isRunning():
-                t.requestInterruption()
-                t.quit()
-                t.wait(2000)
-            t.deleteLater()
+            self._safe_stop_thread(t, 2000)
             self._search_thread = None
         self.search_results_list.clear()
         self.search_status_label.setText('')
@@ -4728,7 +4934,9 @@ class MainWindow(QMainWindow):
           当天第一个版本 → S1200-10_20260708.dsn
           当天第二个版本 → S1200-10_20260708a.dsn
           当天第三个版本 → S1200-10_20260708b.dsn
-          后续版本始终接在当前最大后缀之后，不回填已缺失的旧后缀
+          后续版本始终接在当前最大后缀之后，不回填已缺失的旧后缀；
+          单字母 a-z 用完后继续 aa-zz；达到上限或候选名已存在（含仅大小写不同）时
+          明确提示并拒绝保存，绝不静默覆盖已有文件。
         """
         try:
             if not os.path.isfile(file_path):
@@ -4736,12 +4944,12 @@ class MainWindow(QMainWindow):
             dir_name = os.path.dirname(file_path)
             base_name = os.path.splitext(os.path.basename(file_path))[0]
             ext = os.path.splitext(file_path)[1]
-            # 若文件名末尾已有 _YYYYMMDD 或 _YYYYMMDD[a-z] 后缀，剥离它避免重复
-            date_match = re.search(r'_\d{8}[a-z]?$', base_name)
+            # 若文件名末尾已有 _YYYYMMDD 或 _YYYYMMDD[a-z]{1,2} 后缀，剥离它避免重复
+            date_match = re.search(r'_\d{8}[a-z]{0,2}$', base_name)
             if date_match:
                 base_name = base_name[:date_match.start()]
             today = time.strftime('%Y%m%d')
-            # 查找当天已有的版本；版本号只允许无后缀或单个小写字母后缀。
+            # 查找当天已有的版本；版本号只允许无后缀、单个小写字母或双小写字母后缀。
             # 只取最大后缀的下一个，避免目录中只有 c 时重新生成无后缀/a/b。
             existing_suffix_ranks = []
             version_prefix = base_name + '_' + today
@@ -4749,15 +4957,27 @@ class MainWindow(QMainWindow):
                 stem = os.path.splitext(f)[0]
                 if not f.endswith(ext) or not stem.startswith(version_prefix):
                     continue
-                suffix = stem[len(version_prefix):]
-                if suffix == '':
-                    existing_suffix_ranks.append(0)
-                elif re.fullmatch(r'[a-z]', suffix):
-                    existing_suffix_ranks.append(ord(suffix) - ord('a') + 1)
+                rank = _version_rank_from_suffix(stem[len(version_prefix):])
+                if rank is not None:
+                    existing_suffix_ranks.append(rank)
             next_rank = max(existing_suffix_ranks, default=-1) + 1
-            next_suffix = '' if next_rank == 0 else chr(ord('a') + next_rank - 1)
-            new_name = f'{base_name}_{today}{next_suffix}{ext}'
-            new_path = os.path.join(dir_name, new_name)
+            # 从下一个 rank 起寻找第一个未被占用的后缀（os.path.exists 覆盖仅大小写不同的同名文件），
+            # 杜绝静默覆盖；全部占用则明确报错。
+            new_path = None
+            new_name = None
+            for rank in range(next_rank, MAX_VERSION_RANKS + 1):
+                suffix = _version_suffix_from_rank(rank)
+                if suffix is None:
+                    break
+                candidate = f'{base_name}_{today}{suffix}{ext}'
+                candidate_path = os.path.join(dir_name, candidate)
+                if not os.path.exists(candidate_path):
+                    new_path = candidate_path
+                    new_name = candidate
+                    break
+            if new_path is None:
+                QMessageBox.warning(self, '错误', f'保存版本失败: 当天版本数量已达上限（{MAX_VERSION_RANKS + 1} 个）')
+                return
             shutil.copy2(file_path, new_path)
             self.statusBar().showMessage(f'已保存版本: {new_name}')
         except Exception as e:
@@ -5028,11 +5248,7 @@ class MainWindow(QMainWindow):
                 old.stats_ready.disconnect(self._on_stats_ready)
             except (TypeError, RuntimeError):
                 pass
-            if old.isRunning():
-                old.requestInterruption()
-                old.quit()
-                old.wait(2000)
-            old.deleteLater()
+            self._safe_stop_thread(old, 2000)
             self._stats_thread = None
         root = getattr(self, 'current_folder', None)
         if not root or not os.path.isdir(root):
@@ -5233,15 +5449,18 @@ class MainWindow(QMainWindow):
             table = self.daughterboard_table
         else:
             return
-            for row in range(table.rowCount()):
-                row_path = table.item(row, 0).data(Qt.UserRole)
-                if _same_path(row_path, folder_path):
-                    table.selectRow(row)
-                    table.scrollToItem(table.item(row, 0))
-                    self.current_folder = folder_path
-                    self.file_tree.setRootIndex(self.file_model.index(folder_path))
-                    self.new_structure_btn.setEnabled(True)
-                    break
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item is None:
+                continue
+            row_path = item.data(Qt.UserRole)
+            if _same_path(row_path, folder_path):
+                table.selectRow(row)
+                table.scrollToItem(table.item(row, 0))
+                self.current_folder = folder_path
+                self.file_tree.setRootIndex(self.file_model.index(folder_path))
+                self.new_structure_btn.setEnabled(True)
+                break
     
     def new_folder_structure(self):
         if not self.current_folder:
@@ -5838,7 +6057,7 @@ class MainWindow(QMainWindow):
         box.exec_()
         return box.clickedButton() == open_btn
 
-    def _download_update_asset(self, url, save_path, asset_name='', expected_size=0):
+    def _download_update_asset(self, url, save_path, asset_name='', expected_size=0, expected_sha256=''):
         progress = QProgressDialog('正在下载更新...', '取消', 0, 0, self)
         progress.setWindowTitle('下载更新')
         progress.setWindowModality(Qt.WindowModal)
@@ -5850,17 +6069,8 @@ class MainWindow(QMainWindow):
         # 清理之前的下载线程
         old_thread = getattr(self, 'update_download_thread', None)
         if old_thread is not None:
-            try:
-                old_thread.requestInterruption()
-                old_thread.quit()
-                old_thread.wait(2000)
-            except Exception:
-                pass
-            try:
-                old_thread.deleteLater()
-            except Exception:
-                pass
-        thread = UpdateDownloadThread(url, save_path, expected_size, self)
+            self._safe_stop_thread(old_thread, 2000)
+        thread = UpdateDownloadThread(url, save_path, expected_size, expected_sha256, self)
         self.update_download_thread = thread
 
         def update_progress(downloaded, total, speed, eta, resumed, attempt):
@@ -5926,11 +6136,8 @@ class MainWindow(QMainWindow):
                     getattr(thread, sig_name).disconnect()
                 except (TypeError, RuntimeError):
                     pass
-            if thread.isRunning():
-                thread.requestInterruption()
-                thread.quit()
-                thread.wait(5000)
-            thread.deleteLater()
+            # 安全收尾：等待超时不销毁线程，由 _safe_stop_thread 挂入僵尸列表待 finished 后清理
+            self._safe_stop_thread(thread, 5000)
             if getattr(self, 'update_download_thread', None) is thread:
                 self.update_download_thread = None
 
@@ -5959,6 +6166,12 @@ class MainWindow(QMainWindow):
 
             asset_name = asset.get('name') or 'SeavoExplorer.exe'
             asset_size = int(asset.get('size') or 0)
+            # GitHub API 自 2024 年起为资产提供 digest（"sha256:..."），用于下载内容完整性校验
+            asset_digest = str(asset.get('digest') or '').strip()
+            if asset_digest.startswith('sha256:'):
+                asset_digest = asset_digest[len('sha256:'):]
+            else:
+                asset_digest = ''
             size_mb = asset_size / 1024 / 1024
             asset_line = f'更新文件：{asset_name}'
             if size_mb > 0:
@@ -5986,7 +6199,7 @@ class MainWindow(QMainWindow):
             if not save_path.lower().endswith('.exe'):
                 save_path += '.exe'
 
-            downloaded_path = self._download_update_asset(asset.get('browser_download_url'), save_path, asset_name, asset_size)
+            downloaded_path = self._download_update_asset(asset.get('browser_download_url'), save_path, asset_name, asset_size, asset_digest)
             if not downloaded_path:
                 return
             self.statusBar().showMessage(f'更新已下载: {downloaded_path}')

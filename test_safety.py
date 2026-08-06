@@ -190,6 +190,56 @@ class SaveFileVersionTests(unittest.TestCase):
         self.assertNotIn(f'board_{today}a.dsn', filenames)
         self.assertNotIn(f'board_{today}c.dsn', filenames)
 
+    def test_after_z_continues_with_double_letter(self):
+        """a-z 用完后继续 aa-zz，绝不生成 '{'/'|' 等非法字符或静默覆盖（P0-1 回归）。"""
+        today = time.strftime('%Y%m%d')
+        existing = [f'board_{today}.dsn'] + [
+            f'board_{today}{chr(ord("a") + i)}.dsn' for i in range(26)
+        ]
+        message, filenames = self._save_version_with_files(existing)
+        self.assertIn(f'board_{today}aa.dsn', message)
+        self.assertIn(f'board_{today}aa.dsn', filenames)
+        self.assertFalse(any('{' in name for name in filenames))
+        self.assertFalse(any('|' in name for name in filenames))
+
+    @unittest.skipUnless(sys.platform == 'win32', '仅 Windows 文件系统大小写不敏感，行为与其他平台不同')
+    def test_uppercase_variant_is_not_overwritten(self):
+        """Windows 大小写不敏感：已有大写 A 版本时跳过 a，且原文件内容不被覆盖（P0-1 回归）。"""
+        today = time.strftime('%Y%m%d')
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, 'board.dsn')
+            with open(source, 'w', encoding='utf-8') as stream:
+                stream.write('source')
+            uppercase = f'board_{today}A.dsn'
+            for filename in (f'board_{today}.dsn', uppercase):
+                with open(os.path.join(root, filename), 'w', encoding='utf-8') as stream:
+                    stream.write(filename)
+            status = mock.Mock()
+            window = SimpleNamespace(statusBar=lambda: status)
+            main.MainWindow.save_file_version(window, source)
+            message = status.showMessage.call_args_list[-1].args[0]
+            self.assertIn(f'board_{today}b.dsn', message)
+            self.assertEqual(read_text(os.path.join(root, uppercase)), uppercase)
+
+    def test_version_limit_rejects_without_overwrite(self):
+        """后缀全部占用（0-702）时明确提示且不产生新文件、不覆盖（P0-1 回归）。"""
+        today = time.strftime('%Y%m%d')
+        suffixes = [''] + [main._version_suffix_from_rank(r) for r in range(1, 703)]
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, 'board.dsn')
+            with open(source, 'w', encoding='utf-8') as stream:
+                stream.write('source')
+            for suffix in suffixes:
+                with open(os.path.join(root, f'board_{today}{suffix}.dsn'), 'w', encoding='utf-8') as stream:
+                    stream.write('v')
+            before = set(os.listdir(root))
+            status = mock.Mock()
+            window = SimpleNamespace(statusBar=lambda: status)
+            with mock.patch.object(main.QMessageBox, 'warning') as warn_mock:
+                main.MainWindow.save_file_version(window, source)
+            warn_mock.assert_called()
+            self.assertEqual(set(os.listdir(root)), before)
+
 
 class ExternalClipboardTests(unittest.TestCase):
     def test_local_urls_from_system_clipboard_are_paste_sources(self):
