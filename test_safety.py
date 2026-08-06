@@ -740,7 +740,8 @@ class PreviewButtonFlowTests(unittest.TestCase):
 
 
 class UpdateDownloadSafetyTests(unittest.TestCase):
-    def test_terminal_failure_removes_partial_file(self):
+    def test_terminal_failure_preserves_partial_for_resume(self):
+        """网络类失败保留 .part 供下次续传（与取消路径语义一致）；失败消息含续传提示。"""
         with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as root:
             save_path = os.path.join(root, 'update.exe')
             thread = main.UpdateDownloadThread('https://example.invalid/update.exe', save_path)
@@ -753,8 +754,25 @@ class UpdateDownloadSafetyTests(unittest.TestCase):
             with mock.patch.object(thread, '_download_once', side_effect=error):
                 thread.run()
 
+            self.assertTrue(os.path.exists(thread.part_path))
+            self.assertIn('GitHub 返回错误：HTTP 404', failures[0])
+            self.assertIn('自动续传', failures[0])
+
+    def test_integrity_failure_removes_partial_file(self):
+        """内容校验失败清理临时文件（内容错误续传无意义）。"""
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as root:
+            save_path = os.path.join(root, 'update.exe')
+            thread = main.UpdateDownloadThread('https://example.invalid/update.exe', save_path)
+            thread.MAX_RETRIES = 0
+            with open(thread.part_path, 'wb') as stream:
+                stream.write(b'partial')
+            failures = []
+            thread.download_failed.connect(failures.append)
+            with mock.patch.object(thread, '_download_once', side_effect=main.UpdateDownloadIntegrityError('bad digest')):
+                thread.run()
+
             self.assertFalse(os.path.exists(thread.part_path))
-            self.assertEqual(failures, ['GitHub 返回错误：HTTP 404'])
+            self.assertIn('bad digest', failures[0])
 
     def test_partial_file_survives_between_automatic_retries(self):
         with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as root:
@@ -795,13 +813,14 @@ class UpdateDownloadSafetyTests(unittest.TestCase):
             self.assertEqual(canceled, [(thread.part_path, 7)])
 
     def test_cleanup_failure_is_reported(self):
+        """内容校验失败路径：_reset_partial 清理异常必须被报告（网络类失败保留 .part 不清理）。"""
         with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as root:
             save_path = os.path.join(root, 'update.exe')
             thread = main.UpdateDownloadThread('https://example.invalid/update.exe', save_path)
             thread.MAX_RETRIES = 0
             failures = []
             thread.download_failed.connect(failures.append)
-            with mock.patch.object(thread, '_download_once', side_effect=ValueError('bad data')):
+            with mock.patch.object(thread, '_download_once', side_effect=main.UpdateDownloadIntegrityError('bad data')):
                 with mock.patch.object(
                     thread,
                     '_reset_partial',

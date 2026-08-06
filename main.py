@@ -1546,12 +1546,18 @@ class UpdateDownloadThread(QThread):
             message = f'GitHub 返回错误：HTTP {last_error.code}'
         elif isinstance(last_error, urllib.error.URLError):
             message = f'网络连接失败：{last_error.reason}'
-        cleanup_error = self._reset_partial()
-        if cleanup_error is not None:
-            message += (
-                f'\n下载临时文件未能清理：{self.part_path}'
-                f'\n{cleanup_error}'
-            )
+        if isinstance(last_error, UpdateDownloadIntegrityError):
+            # 内容校验失败：临时文件已在 _download_once 内清理（内容错误续传无意义）
+            cleanup_error = self._reset_partial()
+            if cleanup_error is not None:
+                message += (
+                    f'\n下载临时文件未能清理：{self.part_path}'
+                    f'\n{cleanup_error}'
+                )
+        else:
+            # 网络类失败保留 .part：与取消路径语义一致，下次下载同一地址自动断点续传，
+            # 避免大文件在弱网下反复从头下载
+            message += f'\n已保留部分下载文件 {os.path.basename(self.part_path)}，重新下载时将自动续传'
         self.download_failed.emit(message)
 
 
@@ -2238,12 +2244,11 @@ class NewStructureDialog(QDialog):
             )
     
     def reject(self):
-        """重写取消方法(closeEvent 会统一保存设置,此处无需重复)"""
+        """重写取消方法：取消不保存设置（标题栏 X 与取消按钮语义一致）。"""
         super().reject()
         
     def closeEvent(self, event):
-        """重写关闭事件，保存设置"""
-        self.save_folder_structure()
+        """重写关闭事件：标题栏 X 等同「取消」，不持久化修改，与取消按钮语义一致。"""
         super().closeEvent(event)
     
     def get_structure_info(self):
@@ -5202,8 +5207,17 @@ class MainWindow(QMainWindow):
             base_name = os.path.basename(source_path)
             zip_path, zip_name = self._create_unique_zip_path(parent_dir, base_name)
 
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                self._write_path_to_zip(zf, source_path, parent_dir)
+            try:
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    self._write_path_to_zip(zf, source_path, parent_dir)
+            except Exception:
+                # 写入失败：清理残留的不完整压缩包，避免垃圾文件
+                try:
+                    if os.path.exists(zip_path):
+                        os.remove(zip_path)
+                except OSError:
+                    pass
+                raise
 
             self.statusBar().showMessage(f"已创建压缩包: {zip_name}")
         except Exception as e:
@@ -5237,9 +5251,18 @@ class MainWindow(QMainWindow):
 
             zip_path, zip_name = self._create_unique_zip_path(target_dir, '选中文件')
 
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for source_path in valid_paths:
-                    self._write_path_to_zip(zf, source_path, base_dir)
+            try:
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for source_path in valid_paths:
+                        self._write_path_to_zip(zf, source_path, base_dir)
+            except Exception:
+                # 写入失败：清理残留的不完整压缩包，避免垃圾文件
+                try:
+                    if os.path.exists(zip_path):
+                        os.remove(zip_path)
+                except OSError:
+                    pass
+                raise
 
             self.statusBar().showMessage(f"已创建压缩包: {zip_name}")
         except Exception as e:
