@@ -2372,8 +2372,11 @@ class SettingsDialog(_ReorderableTableDialog):
                 self.regex_default_rb.setChecked(True)
                 self.regex_default_rb.blockSignals(False)
                 self.regex_state = 'default'
-        self.custom_mb_regex = self.regex_mb_edit.text().strip()
-        self.custom_db_regex = self.regex_db_edit.text().strip()
+        # 仅自定义模式保存编辑框文本；默认模式下保留用户上次的自定义正则，
+        # 避免「切回默认并保存」把自定义正则静默覆盖为默认文本
+        if self.regex_state == 'custom':
+            self.custom_mb_regex = self.regex_mb_edit.text().strip()
+            self.custom_db_regex = self.regex_db_edit.text().strip()
         self.accept()
         
     def get_settings(self):
@@ -3005,11 +3008,13 @@ class MainWindow(QMainWindow):
             if isinstance(geo, (list, tuple)) and len(geo) == 4:
                 x, y, w, h = (int(v) for v in geo)
                 if w > 0 and h > 0:
-                    # 屏幕边界检查：窗口矩形与所在屏幕的可用桌面区域必须有交集
+                    # 屏幕边界检查：窗口矩形与所在屏幕的可用桌面区域必须有足够交集
+                    # （仅 1px 相交时窗口几乎不可见，如拔掉副屏后残留坐标，此时保持默认几何）
                     rect = QRect(x, y, w, h)
                     desktop = QApplication.desktop()
                     screen_rect = desktop.availableGeometry(rect.center())
-                    if screen_rect.intersects(rect):
+                    visible = screen_rect.intersected(rect)
+                    if visible.width() >= 100 and visible.height() >= 100:
                         self.setGeometry(rect)
                         geo_applied = True
         except (TypeError, ValueError):
@@ -3483,9 +3488,17 @@ class MainWindow(QMainWindow):
                 btn.clicked.connect(lambda checked, fn=_open_external_once: fn())
             else:
                 _single_shot.timeout.connect(lambda p=path: self._open_quick_access_path(p))
-                # clicked 只启动定时器；若 250ms 内发生双击,_on_double_click 会 stop 掉它
-                btn.clicked.connect(lambda checked, t=_single_shot: t.start())
-                def _on_double_click(event, p=path, t=_single_shot):
+                # 单击启动定时器；双击时用 suppress 标志抑制第二次 release 触发的 clicked
+                # （QPushButton 双击序列会发射两次 clicked，与面包屑按钮的处理一致）
+                _click_state = {'suppress_single': False}
+                def _on_single_click(checked, t=_single_shot, state=_click_state):
+                    if state['suppress_single']:
+                        state['suppress_single'] = False
+                        return
+                    t.start()
+                btn.clicked.connect(_on_single_click)
+                def _on_double_click(event, p=path, t=_single_shot, state=_click_state):
+                    state['suppress_single'] = True
                     # 取消即将触发的单击动作
                     if t.isActive():
                         t.stop()
