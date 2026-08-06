@@ -179,14 +179,14 @@ def _is_regex_safe(pattern):
     except re.error as e:
         return False, str(e)
     # 嵌套量词：括号内 +/* 作用于具体字符（排除 . 通配与量词自身，避免误拒 (.*)? 类安全结构），
-    # 且 ) 后带量词
-    if re.search(r'\([^()]*[^.+*][+*][^()]*\)[+*?]', pattern):
+    # 且 ) 后带重复量词 +/*（? 为 0/1 次可选，无组合爆炸风险，不拦截）
+    if re.search(r'\([^()]*[^.+*][+*][^()]*\)[+*]', pattern):
         return False, 'nested quantifier'
     # 点星组重复：组内含 .*（或 .+）且组外带 +/* —— (a.*)+ 类高危；外层仅 ? 的 (.*)? 属安全可选组
     if re.search(r'\([^()]*\.[*+][^()]*\)[+*]', pattern):
         return False, 'dot-star group repeat'
-    # 嵌套分支：括号内含 | 且 ) 后带量词
-    if re.search(r'\([^()]*\|[^()]*\)[+*?]', pattern):
+    # 嵌套分支：括号内含 | 且 ) 后带重复量词 +/*
+    if re.search(r'\([^()]*\|[^()]*\)[+*]', pattern):
         return False, 'nested alternation'
     return True, ''
 

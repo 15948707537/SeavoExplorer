@@ -55,15 +55,23 @@ class ProjectVersionTests(unittest.TestCase):
         self.assertEqual(bare_handlers, [])
 
     def test_project_regex_validation_contract(self):
-        """自定义正则校验契约：默认规则文本可保存；嵌套量词（ReDoS 高危）被拒绝；组 1 非数字被拒绝。"""
+        """自定义正则校验契约：默认规则与可选组可保存；嵌套重复量词（ReDoS 高危）被拒绝；组 1 非数字被拒绝。"""
         ok, err = main._validate_project_regex(main.DEFAULT_MB_RE_TEXT)
         self.assertTrue(ok, err)
         ok, err = main._validate_project_regex(main.DEFAULT_DB_RE_TEXT)
         self.assertTrue(ok, err)
+        # 可选组（? 为 0/1 次，无组合爆炸）应放行
+        ok, err = main._validate_project_regex(r'^S(\d{3,4})(-\d+)?$')
+        self.assertTrue(ok, err)
+        ok, err = main._validate_project_regex(r'^S(\d{3,4})(?:-(.*))?$')
+        self.assertTrue(ok, err)
+        # 嵌套重复量词：灾难性回溯高危，拒绝
         ok, err = main._validate_project_regex(r'^(a+)+$')
         self.assertFalse(ok)
         self.assertIn('回溯', err)
         ok, err = main._validate_project_regex(r'^(a|aa)+$')
+        self.assertFalse(ok)
+        ok, err = main._validate_project_regex(r'^(a.*)+$')
         self.assertFalse(ok)
         ok, err = main._validate_project_regex(r'^S([A-Za-z]+)$')
         self.assertFalse(ok)
