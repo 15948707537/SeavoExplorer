@@ -130,6 +130,26 @@ def _version_rank_from_suffix(suffix):
         return 27 + (ord(suffix[0]) - ord('a')) * 26 + (ord(suffix[1]) - ord('a'))
     return None
 
+_WINDOWS_RESERVED_NAMES = frozenset(['CON', 'PRN', 'AUX', 'NUL', 'CLOCK$'])
+
+def _validate_windows_filename(name):
+    """校验 Windows 文件名合法性。返回错误提示；合法返回 None。
+
+    检查：空名/点目录、非法字符 \\/:*?\"<>|、尾随点或空格、设备保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）。
+    """
+    if not name:
+        return '名称不能为空'
+    if name in ('.', '..'):
+        return '名称不能为 "." 或 ".."'
+    if re.search(r'[\\/:*?"<>|]', name):
+        return '名称不能包含 \\ / : * ? " < > | 字符'
+    if name.endswith(('.', ' ')):
+        return '名称不能以点或空格结尾'
+    stem = name.split('.')[0].strip().upper()
+    if stem in _WINDOWS_RESERVED_NAMES or re.fullmatch(r'(?:COM|LPT)[1-9]', stem):
+        return f'"{stem}" 是 Windows 保留名称，请更换名称'
+    return None
+
 def _is_regex_safe(pattern):
     """检测正则是否有 ReDoS（灾难性回溯）风险。"""
     import time
@@ -1285,7 +1305,12 @@ class RenameDialog(QDialog):
             self.new_name = new_base + new_ext
         else:
             self.new_name = new_base
-        
+
+        error = _validate_windows_filename(self.new_name)
+        if error:
+            QMessageBox.warning(self, '警告', error)
+            return
+
         if self.new_name == self.old_name:
             self.reject()
             return
@@ -1308,7 +1333,9 @@ class UpdateDownloadThread(QThread):
     download_canceled = pyqtSignal(str, int)
 
     CHUNK_SIZE = 1024 * 1024
-    DOWNLOAD_TIMEOUT = 90
+    DOWNLOAD_TIMEOUT = 90      # 连接/首次读取超时
+    READ_TIMEOUT = 3           # 单次 socket 读取超时：使取消响应延迟从最长 90s 降到约 3s
+    MAX_READ_STALLS = 5        # 连续无数据超时上限（约 15s 无数据则交给外层重试）
     MAX_RETRIES = 3
 
     def __init__(self, url, save_path, expected_size=0, expected_sha256='', parent=None):
@@ -1394,6 +1421,13 @@ class UpdateDownloadThread(QThread):
             last_emit = 0
             os.makedirs(os.path.dirname(self.save_path) or '.', exist_ok=True)
             self.progress_changed.emit(downloaded, total, 0.0, -1, resumed, attempt)
+            # 缩短单次读取超时：read 阻塞期间 requestInterruption 无法响应，
+            # 通过小超时轮询让取消/关窗及时生效（慢网未取消时继续等待数据）
+            try:
+                response.fp.raw._sock.settimeout(self.READ_TIMEOUT)
+            except Exception:
+                pass
+            stall_count = 0
             with open(self.part_path, mode) as f:
                 while True:
                     if self.isInterruptionRequested():
@@ -1404,7 +1438,22 @@ class UpdateDownloadThread(QThread):
                             pass
                         self.download_canceled.emit(self.part_path, downloaded)
                         return False
-                    chunk = response.read(self.CHUNK_SIZE)
+                    try:
+                        chunk = response.read(self.CHUNK_SIZE)
+                    except (socket.timeout, TimeoutError):
+                        if self.isInterruptionRequested():
+                            f.flush()
+                            try:
+                                os.fsync(f.fileno())
+                            except OSError:
+                                pass
+                            self.download_canceled.emit(self.part_path, downloaded)
+                            return False
+                        stall_count += 1
+                        if stall_count >= self.MAX_READ_STALLS:
+                            raise  # 长时间无数据：交给外层重试逻辑
+                        continue  # 慢网：未取消则继续等待数据
+                    stall_count = 0
                     if not chunk:
                         break
                     f.write(chunk)
@@ -1538,6 +1587,57 @@ class ArchiveExtractThread(QThread):
             self.extract_failed.emit(str(e))
         finally:
             self._process = None
+
+
+class VideoFrameThread(QThread):
+    """后台提取视频多帧缩略图，避免大视频解码卡住 UI 线程。
+
+    返回 QImage 列表（QImage 可跨线程传递；QPixmap 必须在 GUI 线程创建）。
+    """
+    frames_ready = pyqtSignal(str, list)  # video_path, [QImage, ...]
+
+    def __init__(self, video_path, target_height=480, parent=None):
+        super().__init__(parent)
+        self.video_path = video_path
+        self.target_height = target_height
+
+    def run(self):
+        images = self._capture_images(self.video_path, self.target_height)
+        self.frames_ready.emit(self.video_path, images)
+
+    def _capture_images(self, path, target_height):
+        if not HAS_OPENCV:
+            return []
+        images = []
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            return []
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                return []
+            for pos in VIDEO_PREVIEW_POSITIONS:
+                if self.isInterruptionRequested():
+                    break
+                frame_no = max(0, min(int(total_frames * pos), total_frames - 1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = frame_rgb.shape
+                scale = target_height / h
+                new_w = max(1, int(round(w * scale)))
+                resized = cv2.resize(frame_rgb, (new_w, target_height), interpolation=cv2.INTER_AREA)
+                q_img = QImage(resized.data, resized.shape[1], resized.shape[0], resized.shape[1] * ch, QImage.Format_RGB888).copy()
+                images.append(q_img)
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        return images
 
 
 class FolderScanThread(QThread):
@@ -3980,8 +4080,9 @@ class MainWindow(QMainWindow):
             '_stats_thread': ('stats_ready',),
             '_search_thread': ('search_ready',),
             'scan_thread': ('scan_completed', 'scan_progress'),
+            '_video_thumb_thread': ('frames_ready',),
         }
-        for attr in ('_stats_thread', '_search_thread', 'scan_thread'):
+        for attr in ('_stats_thread', '_search_thread', 'scan_thread', '_video_thumb_thread'):
             t = getattr(self, attr, None)
             if t is not None:
                 try:
@@ -5008,7 +5109,9 @@ class MainWindow(QMainWindow):
             
             new_name = dialog.get_new_name()
             new_path = os.path.join(parent_dir, new_name)
-            if os.path.exists(new_path):
+            # 仅改大小写时 new_path 与 file_path 是同一文件（Windows 大小写不敏感），允许大小写重命名；
+            # 其余情况目标已存在则拒绝
+            if os.path.exists(new_path) and not _same_path(new_path, file_path):
                 QMessageBox.warning(self, '警告', f'名称 "{new_name}" 已存在')
                 return
             
@@ -5610,10 +5713,33 @@ class MainWindow(QMainWindow):
     def _preview_video(self, file_path):
         try:
             self.current_video_path = file_path
-            frames = self.generate_video_thumbnails()
+            # 先显示占位提示，缩略图在后台线程生成，避免大视频解码卡住 UI
+            self.preview_tab.show()
+            self.image_scroll_area.hide()
+            self.preview_tab.setPlainText('正在生成视频缩略图...')
+            old = getattr(self, '_video_thumb_thread', None)
+            if old is not None and old.isRunning():
+                self._safe_stop_thread(old, 1500)
+            thread = VideoFrameThread(file_path, 96, self)
+            self._video_thumb_thread = thread
+            thread.frames_ready.connect(self._on_video_frames_ready)
+            thread.start()
+        except Exception as e:
+            self.preview_tab.show()
+            self.image_scroll_area.hide()
+            self.preview_tab.setPlainText(f'视频预览错误: {str(e)}')
+
+    def _on_video_frames_ready(self, video_path, images):
+        """视频缩略图后台生成完成：拼接显示。过期结果（已切换文件）直接丢弃。"""
+        if video_path != getattr(self, 'current_video_path', None):
+            return
+        if getattr(self, '_video_thumb_thread', None) is not None:
+            self._video_thumb_thread = None
+        try:
+            frames = [QPixmap.fromImage(img) for img in images]
             if not frames:
                 # fall back 到单帧
-                single = self.generate_video_thumbnail(file_path)
+                single = self.generate_video_thumbnail(video_path)
                 if single is not None:
                     frames = [QPixmap.fromImage(single)]
             if frames:
@@ -5633,15 +5759,15 @@ class MainWindow(QMainWindow):
                 painter.end()
                 self.image_label.setPixmap(composite)
                 self.image_label.setToolTip(
-                    f'视频: {os.path.basename(file_path)}\n左→右分别对应 {",".join(f"{int(p*100)}%" for p in VIDEO_PREVIEW_POSITIONS)} 位置\n点击查看大图')
-                self.current_image_path = file_path
+                    f'视频: {os.path.basename(video_path)}\n左→右分别对应 {",".join(f"{int(p*100)}%" for p in VIDEO_PREVIEW_POSITIONS)} 位置\n点击查看大图')
+                self.current_image_path = video_path
             else:
                 self.preview_tab.show()
                 self.image_scroll_area.hide()
                 if HAS_OPENCV:
-                    self.preview_tab.setPlainText(f'视频: {os.path.basename(file_path)}\n无法生成视频缩略图')
+                    self.preview_tab.setPlainText(f'视频: {os.path.basename(video_path)}\n无法生成视频缩略图')
                 else:
-                    self.preview_tab.setPlainText(f'视频: {os.path.basename(file_path)}\n视频缩略图功能需要安装OpenCV (pip install opencv-python numpy pillow)')
+                    self.preview_tab.setPlainText(f'视频: {os.path.basename(video_path)}\n视频缩略图功能需要安装OpenCV (pip install opencv-python numpy pillow)')
         except Exception as e:
             self.preview_tab.show()
             self.image_scroll_area.hide()
@@ -6530,9 +6656,8 @@ class MainWindow(QMainWindow):
         dialog.exec_()
 
     def _show_video_frames(self, path):
-        """视频多帧预览(上一张/下一张 + 缩放)。"""
-        frames = self._capture_video_frames(path, target_height=480)
-        if not frames:
+        """视频多帧预览(上一张/下一张 + 缩放)。帧提取在后台线程，避免大视频解码卡住 UI。"""
+        if not HAS_OPENCV:
             QMessageBox.information(self, '提示', '无法提取视频帧,请确认已安装 OpenCV (pip install opencv-python)')
             return
 
@@ -6549,7 +6674,7 @@ class MainWindow(QMainWindow):
         nav_layout = QHBoxLayout()
         prev_btn = QPushButton('◀ 上一张')
         next_btn = QPushButton('下一张 ▶')
-        page_label = QLabel()
+        page_label = QLabel('正在提取视频帧...')
         page_label.setAlignment(Qt.AlignCenter)
         nav_layout.addWidget(prev_btn)
         nav_layout.addWidget(page_label, 1)
@@ -6563,9 +6688,12 @@ class MainWindow(QMainWindow):
         layout.addLayout(zoom_bar)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        state = {'idx': 0, 'frames': frames}
+        state = {'idx': 0, 'frames': []}
 
         def show_frame(idx):
+            frames = state['frames']
+            if not frames:
+                return
             state['idx'] = idx
             image_label.setPixmap(frames[idx])  # 重置缩放并显示新帧
             pos_pct = int(VIDEO_PREVIEW_POSITIONS[idx] * 100)
@@ -6574,25 +6702,43 @@ class MainWindow(QMainWindow):
             prev_btn.setEnabled(idx > 0)
             next_btn.setEnabled(idx < len(frames) - 1)
 
+        def on_frames_ready(video_path, images):
+            if video_path != path:
+                return
+            try:
+                state['frames'] = [QPixmap.fromImage(img) for img in images]
+                if state['frames']:
+                    show_frame(0)
+                else:
+                    page_label.setText('无法提取视频帧')
+            except RuntimeError:
+                pass  # 对话框已关闭
+
         prev_btn.clicked.connect(lambda: show_frame(max(0, state['idx'] - 1)))
-        next_btn.clicked.connect(lambda: show_frame(min(len(frames) - 1, state['idx'] + 1)))
+        next_btn.clicked.connect(lambda: show_frame(min(len(state['frames']) - 1, state['idx'] + 1)))
 
         # 快捷键:左/上=上一张, 右/下=下一张(QShortcut 无需焦点)
         def go_prev():
             if state['idx'] > 0:
                 show_frame(state['idx'] - 1)
         def go_next():
-            if state['idx'] < len(frames) - 1:
+            if state['idx'] < len(state['frames']) - 1:
                 show_frame(state['idx'] + 1)
         QShortcut(Qt.Key_Left, dialog, go_prev, context=Qt.WindowShortcut)
         QShortcut(Qt.Key_Up, dialog, go_prev, context=Qt.WindowShortcut)
         QShortcut(Qt.Key_Right, dialog, go_next, context=Qt.WindowShortcut)
         QShortcut(Qt.Key_Down, dialog, go_next, context=Qt.WindowShortcut)
 
-        show_frame(0)
         screen = QApplication.desktop().screenGeometry()
         dialog.resize(int(screen.width() * 0.85), int(screen.height() * 0.85))
+
+        # 后台线程提取帧
+        thread = VideoFrameThread(path, 480)
+        thread.frames_ready.connect(on_frames_ready)
+        thread.start()
         dialog.exec_()
+        # 对话框关闭后安全停止线程（超时挂入僵尸列表，绝不销毁运行中线程）
+        self._safe_stop_thread(thread, 3000)
 
     def _make_zoom_bar(self, image_label, dialog):
         """创建底部缩放控制栏:放大/缩小/重置 + 缩放比例显示。"""
