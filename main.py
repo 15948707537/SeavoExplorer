@@ -2435,10 +2435,8 @@ class SettingsDialog(_ReorderableTableDialog):
         self._test_regex()
 
     def _on_regex_mode_changed(self, state):
-        print(f'DEBUG: _on_regex_mode_changed called with state={state}')
         self.regex_state = state
         self._refresh_regex_ui()
-        print(f'DEBUG: regex_state={self.regex_state}, mb_edit enabled={self.regex_mb_edit.isEnabled()}')
 
 
     def _test_regex(self):
@@ -4247,6 +4245,10 @@ class MainWindow(QMainWindow):
         message = f"共找到 {len(visible_motherboard_folders)} 个主板文件夹，{len(visible_daughterboard_folders)} 个子卡文件夹"
         if hidden_count:
             message += f"，已隐藏 {hidden_count} 个项目"
+        if getattr(self, '_regex_fallback', False):
+            # 自定义正则无效已回退默认：明确提示，避免用户误以为自定义规则生效
+            message += '（自定义正则无效，已回退到默认规则）'
+            self._regex_fallback = False
         self.statusBar().showMessage(message)
 
         if self.pinned_folders:
@@ -4271,11 +4273,14 @@ class MainWindow(QMainWindow):
                 self.last_project_path = None
                 return
             name = os.path.basename(target)
-            match = self.folder_regex_mb.match(name) or self.folder_regex_db.match(name)
-            if not match:
+            # 按当前生效的正则（含自定义）判定归属，不硬编码 S/M 前缀
+            if self.folder_regex_mb.match(name):
+                table = self.motherboard_table
+            elif self.folder_regex_db.match(name):
+                table = self.daughterboard_table
+            else:
                 self.last_project_path = None
                 return
-            table = self.motherboard_table if match.group(1) == 'S' else self.daughterboard_table
             for row in range(table.rowCount()):
                 if _same_path(table.item(row, 0).data(Qt.UserRole), target):
                     table.selectRow(row)
