@@ -54,6 +54,23 @@ class ProjectVersionTests(unittest.TestCase):
         ]
         self.assertEqual(bare_handlers, [])
 
+    def test_project_regex_validation_contract(self):
+        """自定义正则校验契约：默认规则文本可保存；嵌套量词（ReDoS 高危）被拒绝；组 1 非数字被拒绝。"""
+        ok, err = main._validate_project_regex(main.DEFAULT_MB_RE_TEXT)
+        self.assertTrue(ok, err)
+        ok, err = main._validate_project_regex(main.DEFAULT_DB_RE_TEXT)
+        self.assertTrue(ok, err)
+        ok, err = main._validate_project_regex(r'^(a+)+$')
+        self.assertFalse(ok)
+        self.assertIn('回溯', err)
+        ok, err = main._validate_project_regex(r'^(a|aa)+$')
+        self.assertFalse(ok)
+        ok, err = main._validate_project_regex(r'^S([A-Za-z]+)$')
+        self.assertFalse(ok)
+        self.assertIn('纯数字', err)
+        ok, err = main._validate_project_regex(r'^S(1000)$')
+        self.assertTrue(ok, err)
+
 
 class NewProjectDefaultsTests(unittest.TestCase):
     @classmethod
@@ -65,7 +82,6 @@ class NewProjectDefaultsTests(unittest.TestCase):
         dialog = main.NewProjectDialog(default_folder=None)
         self.assertEqual(dialog.target_folder, expected_home)
         dialog.deleteLater()
-
         captured = {}
 
         def capture_settings(path, data, make_hidden=True):
