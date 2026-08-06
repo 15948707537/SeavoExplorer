@@ -73,6 +73,10 @@ def _validate_project_regex(pattern):
         compiled = re.compile(pattern)
     except re.error as e:
         return False, f'正则无效: {e}'
+    # ReDoS 防护：灾难性回溯风险的正则拒绝保存
+    ok_safe, safe_msg = _is_regex_safe(pattern)
+    if not ok_safe:
+        return False, f'正则存在灾难性回溯风险（{safe_msg}），请简化规则'
     if compiled.groups < 1:
         return False, '正则至少需要 1 个捕获组（组 1 作为项目编号，如 (\\d{3,4})）'
     for sample in ('S100', 'M999', 'S1234_注释', 'SABC'):
@@ -161,20 +165,25 @@ def _coerce_bool(value, default=False):
     return default
 
 def _is_regex_safe(pattern):
-    """检测正则是否有 ReDoS（灾难性回溯）风险。"""
-    import time
+    """检测正则是否有 ReDoS（灾难性回溯）风险（启发式）。
+
+    仅做结构检查，绝不实际执行可疑模式的搜索：
+    CPython 的 re 回溯在 C 层持有 GIL，任何"实测超时"方案都会卡死本进程；
+    子进程方案在 PyInstaller 打包环境不可用。启发式拦截常见灾难性回溯结构：
+    1. 嵌套量词：(a+)+、(a*)*、(a+)? 等；
+    2. 嵌套分支：(a|aa)+、(a|b)* 等。
+    复杂变体可能漏检，属尽力而为的防护（与 AGENTS.md 记录一致）。
+    """
     try:
-        compiled = re.compile(pattern)
+        re.compile(pattern)
     except re.error as e:
         return False, str(e)
-    for test_str in ['A' * 50, 'a' * 50, '1' * 50, '_' * 50]:
-        start = time.monotonic()
-        try:
-            compiled.search(test_str)
-            if time.monotonic() - start > 0.5:
-                return False, 'match too slow'
-        except RuntimeError:
-            return False, 'recursion limit'
+    # 嵌套量词：( 内含 +/* 且 ) 后带量词
+    if re.search(r'\([^()]*[+*][^()]*\)[+*?]', pattern):
+        return False, 'nested quantifier'
+    # 嵌套分支：括号内含 | 且 ) 后带量词
+    if re.search(r'\([^()]*\|[^()]*\)[+*?]', pattern):
+        return False, 'nested alternation'
     return True, ''
 
 APP_VERSION = '0.5.3'
@@ -3467,14 +3476,19 @@ class MainWindow(QMainWindow):
                 return None
             bak = file_path + '.bak'
             if os.path.exists(bak):
+                # 旧备份存在：用时间戳后缀 + 递增序号，绝不覆盖上次备份（同秒多次损坏也可区分）
                 bak = file_path + '.bak.' + time.strftime('%Y%m%d_%H%M%S')
+                seq = 1
+                while os.path.exists(bak):
+                    bak = file_path + '.bak.' + time.strftime('%Y%m%d_%H%M%S') + f'.{seq}'
+                    seq += 1
+                    if seq > 100:
+                        break
             try:
                 if sys.platform == 'win32':
                     ctypes.windll.kernel32.SetFileAttributesW(file_path, 0x80)
             except Exception:
                 pass
-            if os.path.exists(bak):
-                os.remove(bak)
             os.replace(file_path, bak)
             return bak
         except Exception:
@@ -5522,6 +5536,8 @@ class MainWindow(QMainWindow):
                     i = 1
                     while os.path.exists(os.path.join(target_dir, f'{base}_{i}{ext}')):
                         i += 1
+                        if i > 100000:  # 安全上限，避免极端情况无限循环
+                            raise Exception(f'无法生成唯一的归档文件名（已尝试 {i} 次），请清理 old/ 目录')
                     dest = os.path.join(target_dir, f'{base}_{i}{ext}')
                 shutil.move(file_path, dest)
                 moved += 1
