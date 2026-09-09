@@ -1,6 +1,8 @@
 # SeavoExplorer Windows 构建与发布指南
 
-本文以本机已经跑通的 v0.5.0/v0.5.1/v0.6.0 构建与发布事实为基础，并记录仓库当前固化的后续流程。v0.6.0（2026-09-09）已按同一严格环境完成 clean onefile 构建与 GitHub 发布：annotated tag `v0.6.0`（tag object `589e35669d47f4b974160cb474def7d22f3b4228`）指向 `29b3dab5960ef9efd55a5123294f19ca17b38e7f`，EXE 96,948,502 bytes，SHA-256 `44E769B707F6DDEB144B5994BF7674AE33FA9E64317243125387F615291A75D2`，三资产远端 digest 已核对。`main.spec` 是 onefile/onedir 的唯一 PyInstaller 配置来源；draft、三资产 digest 核验与 publish 已随 v0.5.1 完成首次真实 GitHub 端到端发布。`--resume` 恢复前检仍由无网络单元测试覆盖，只有真实中断时才执行。
+本文以本机已经跑通的 v0.5.0/v0.5.1/v0.6.0/v0.6.1 构建与发布事实为基础，并记录仓库当前固化的后续流程。v0.6.0（2026-09-09）已按同一严格环境完成 clean onefile 构建与 GitHub 发布：annotated tag `v0.6.0`（tag object `589e35669d47f4b974160cb474def7d22f3b4228`）指向 `29b3dab5960ef9efd55a5123294f19ca17b38e7f`，EXE 96,948,502 bytes，SHA-256 `44E769B707F6DDEB144B5994BF7674AE33FA9E64317243125387F615291A75D2`，三资产远端 digest 已核对。
+
+v0.6.1（2026-09-09）已发布：annotated tag `v0.6.1`（tag object `a7929378bebcd0061e4208ec3eab5799f45c8e72`）指向 `4b47e2d18673e7c1de1cffb79ac4c3334f5bc1db`，EXE 96,963,776 bytes，SHA-256 `994D7CBF7D3141BB532C2CAA7740AC7535ABD4BF17DC0F25AC6C8209F70D6001`；使用自签名证书，其他电脑仍可能显示 SmartScreen。`main.spec` 是 onefile/onedir 的唯一 PyInstaller 配置来源；draft、三资产 digest 核验与 publish 已随 v0.5.1 完成首次真实 GitHub 端到端发布。`--resume` 恢复前检仍由无网络单元测试覆盖，只有真实中断时才执行。
 
 ## 1. 已验证基线
 

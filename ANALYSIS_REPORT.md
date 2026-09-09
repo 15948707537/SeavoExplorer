@@ -62,6 +62,7 @@
 - 新增自签名构建管线：`SEAVO_SIGN_MODE=store|pfx`、manifest `code_signing`、`SEAVO_REQUIRE_SIGNING=1` 发布门禁。
 - 新增同 EXE 更新模式：`--apply-update` 等待旧 PID 退出，用 `ReplaceFileW` 替换并保留 `.old` 备份，主程序提供“下载并更新”入口。
 - 测试增至 117 项；当前发布使用自签名证书，Windows SmartScreen 仍可能提示“未知发布者”。
+- v0.6.1 发布：tag `v0.6.1`（tag object `a7929378bebcd0061e4208ec3eab5799f45c8e72`）指向 `4b47e2d18673e7c1de1cffb79ac4c3334f5bc1db`；EXE 96,963,776 bytes，SHA-256 `994D7CBF7D3141BB532C2CAA7740AC7535ABD4BF17DC0F25AC6C8209F70D6001`；发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.1
 
 ### 其他更正
 

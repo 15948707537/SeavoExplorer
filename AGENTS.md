@@ -168,6 +168,7 @@ git status --short
 - 自定义正则安全检查已接入保存与解析链路，并在 0.6.0 升级为结构启发式；仍需注意它不能覆盖所有复杂正则。
 - annotated tag `v0.6.0`（tag object `589e35669d47f4b974160cb474def7d22f3b4228`）指向 `29b3dab5960ef9efd55a5123294f19ca17b38e7f`，发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.0
 - 已发布 v0.6.0 EXE 为 96,948,502 bytes，SHA-256：`44E769B707F6DDEB144B5994BF7674AE33FA9E64317243125387F615291A75D2`；远端三资产 digest 已核对。
-- v0.6.1 发布信息见 GitHub Release；发布后补充 tag、commit、EXE 大小与 SHA-256。
+- annotated tag `v0.6.1`（tag object `a7929378bebcd0061e4208ec3eab5799f45c8e72`）指向 `4b47e2d18673e7c1de1cffb79ac4c3334f5bc1db`，发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.1
+- 已发布 v0.6.1 EXE 为 96,963,776 bytes，SHA-256：`994D7CBF7D3141BB532C2CAA7740AC7535ABD4BF17DC0F25AC6C8209F70D6001`；使用自签名证书，远端三资产 digest 已核对。
 
 交付时明确报告修改文件、实际执行的检查、构建产物哈希和未执行事项；不要把“语法可解析”表述成“GUI 功能已验证”。
