@@ -57,6 +57,12 @@
   - GitHub Release：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.0
   - 远端三资产（EXE、`.sha256`、`.build.json`）digest 已核对；独立下载 EXE 复核哈希一致。
 
+### 0.6.1 补充（2026-09-09）
+
+- 新增自签名构建管线：`SEAVO_SIGN_MODE=store|pfx`、manifest `code_signing`、`SEAVO_REQUIRE_SIGNING=1` 发布门禁。
+- 新增同 EXE 更新模式：`--apply-update` 等待旧 PID 退出，用 `ReplaceFileW` 替换并保留 `.old` 备份，主程序提供“下载并更新”入口。
+- 测试增至 117 项；当前发布使用自签名证书，Windows SmartScreen 仍可能提示“未知发布者”。
+
 ### 其他更正
 
 - 原报告"`_transactional_extract_archive` 6 处测试调用"应为 **8 处**（922、941、954、967、974、985、1001、1074）。

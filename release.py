@@ -412,12 +412,19 @@ def _notes_prefix(manifest):
         '- Windows 单文件：`{name}`（{size} bytes）\n'
         '- SHA-256：`{sha256}`\n'
         '- 构建 manifest 与独立 SHA-256 文件已作为附件上传。\n\n'
-        '> 该 EXE 尚未进行 Authenticode 代码签名；请只从本发布页下载并核对哈希。'
+        '{signing_note}'
     ).format(
         commit=source['commit'],
         name=artifact['name'],
         size=artifact['size'],
         sha256=artifact['sha256'],
+        signing_note=(
+            '> 该 EXE 已使用自签名证书进行 Authenticode 签名，但证书未受公共信任；'
+            'Windows SmartScreen 仍可能提示“未知发布者”。请只从本发布页下载并核对哈希。'
+            if (manifest.get('code_signing') or {}).get('signed')
+            and not (manifest.get('code_signing') or {}).get('trusted')
+            else '> 该 EXE 尚未进行 Authenticode 代码签名；请只从本发布页下载并核对哈希。'
+        ),
     )
 
 

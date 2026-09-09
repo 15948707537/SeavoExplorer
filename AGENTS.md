@@ -16,9 +16,9 @@
 
 ## 项目概况
 
-SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以 S/M 编号命名的硬件/PCB 项目目录。界面、业务和平台集成集中在约 7,362 行的 `main.py`。
+SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以 S/M 编号命名的硬件/PCB 项目目录。界面、业务和平台集成集中在约 7,648 行的 `main.py`。
 
-- 当前版本为 0.6.0；运行时版本的首要来源是 `main.py` 的 `APP_VERSION`。
+- 当前版本为 0.6.1；运行时版本的首要来源是 `main.py` 的 `APP_VERSION`。
 - 源码保持 Python 3.8 grammar 兼容；官方 Windows EXE 已验证环境为 Python 3.13.2 x64。
 - UI、用户提示和主要文档使用中文，文本统一 UTF-8。
 - Windows 是实际目标平台，代码使用 `os.startfile`、Windows Shell/`ctypes`、强制回收站接口和固定的 7-Zip 安装位置。
@@ -29,14 +29,14 @@ SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以
 | 路径 | 职责与注意事项 |
 | --- | --- |
 | `main.py` | 应用入口和全部主要产品逻辑；运行行为的首要事实来源。 |
-| `test_safety.py` | 81 项产品安全/回归测试；会导入 PyQt5，但使用临时数据，不应接触真实项目。 |
-| `test_tooling.py` | 23 项无网络辅助链路测试：版本、哈希、严格环境、manifest、快照、完整遍历、环境净化、tag/draft/assets。 |
+| `test_safety.py` | 88 项产品安全/回归测试；会导入 PyQt5，但使用临时数据，不应接触真实项目。 |
+| `test_tooling.py` | 29 项无网络辅助链路测试：版本、哈希、严格环境、manifest、快照、完整遍历、环境净化、tag/draft/assets。 |
 | `requirements.txt` | Python >=3.8 源码运行依赖范围，不含 PyInstaller。 |
 | `requirements-build.txt` | Python 3.13.2 x64 官方构建环境的精确版本锁；除 venv 自带 pip/wheel 外，正式构建拒绝锁外发行包。 |
 | `pyproject.toml` | 项目元数据；运行依赖从 `requirements.txt` 动态读取。项目是单模块，不声明无效入口。 |
 | `LICENSE` | 与 `pyproject.toml` 一致的 MIT 许可正文。 |
 | `main.spec` | onefile/onedir 共用的唯一 PyInstaller 配置；默认 onefile。 |
-| `build_support.py` | 构建前检、环境隔离、版本资源、TOC 审计、冒烟、哈希、manifest。 |
+| `build_support.py` | 构建前检、环境隔离、版本资源、TOC 审计、Authenticode 签名/校验、冒烟、哈希、manifest。 |
 | `build_onefile.py` | onefile 薄包装器；默认离线，不安装依赖、不重生图标。 |
 | `build_onedir.py` | onedir 薄包装器；与 onefile 共用 `main.spec`。 |
 | `make_ico.py` | 显式维护命令；从 PNG 或现有 ICO 原子重建多尺寸 ICO。正常构建不调用。 |
@@ -88,6 +88,13 @@ SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以
 
 新增/改名设置项至少同步默认值、加载、保存、对话框、运行时消费者、旧配置兼容和帮助文本。
 
+### 代码签名与更新
+
+- `SEAVO_SIGN_MODE=store|pfx` 启用 Authenticode 签名；manifest 的 `code_signing` 记录主体、指纹、验证状态和时间戳。
+- `SEAVO_REQUIRE_SIGNING=1` 让 `release.py` 拒绝未签名 manifest；自签名开发构建需同时设置 `SEAVO_SIGN_ALLOW_UNTRUSTED=1`。
+- 打包后的 EXE 支持 `--apply-update --target ... --pid ... --sha256 ...`：等待旧进程退出后用 `ReplaceFileW` 替换并保留 `.old` 备份；源码模式必须拒绝更新模式。
+- 自签名不会消除其他电脑的 SmartScreen 提示，正式发布应换用公共可信证书。
+
 ### 线程与 UI
 
 磁盘扫描、统计、搜索、下载和媒体处理不能移回 UI 线程。后台线程通过信号更新控件；替换任务时保留 token/取消/`requestInterruption()`，窗口关闭前正确结束线程。
@@ -132,7 +139,7 @@ git diff --check
 git status --short
 ```
 
-当前 104 项测试中，81 项产品测试覆盖版本/裸 `except`、默认路径、终端、回收站、7-Zip 授权、手动预览、路径规范化、预览资源释放、外部剪贴板粘贴、面包屑双击、保存版本后缀递增、更新 `.part`、事务式解压、正则结构安全、文本编码/BOM、zip 去重、folder_structure 归一化、失效根目录错误信号、old/ 守卫和文档一致性；23 项 tooling tests 覆盖构建/发布的 fail-closed 契约。它们不是完整 GUI/所有文件格式的端到端测试，报告时必须区分。
+当前 117 项测试中，88 项产品测试覆盖版本/裸 `except`、默认路径、终端、回收站、7-Zip 授权、手动预览、路径规范化、预览资源释放、外部剪贴板粘贴、面包屑双击、保存版本后缀递增、更新 `.part`、事务式解压、正则结构安全、文本编码/BOM、zip 去重、folder_structure 归一化、失效根目录错误信号、old/ 守卫和文档一致性；29 项 tooling tests 覆盖构建/发布、代码签名和 manifest 的 fail-closed 契约。它们不是完整 GUI/所有文件格式的端到端测试，报告时必须区分。
 
 正式 onefile 验证必须使用由 `requirements-build.txt` 创建、未启用 system-site-packages，且除 venv 自带 pip/wheel 外无锁外包的 Python 3.13.2 x64 venv：
 
@@ -157,9 +164,10 @@ git status --short
 - annotated tag `v0.5.1` 指向 `c0b71a0`，发布页为：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.5.1
 - 已发布 v0.5.1 EXE 为 96,926,112 bytes，SHA-256：`126134AF93E31344768B847760B25FFE56F24C966AC36EE5216003D51B661937`。
 - draft→三资产 digest 核验→publish 自动化已随 v0.5.1 完成首次真实 GitHub 端到端发布；三个远端资产均已核对 digest。
-- 新构建会写入 PE FileVersion/ProductVersion；这不等于 Authenticode 签名。当前没有签名证书。
+- 新构建会写入 PE FileVersion/ProductVersion；这不等于公共可信的 Authenticode 签名。当前 0.6.1 使用自签名证书。
 - 自定义正则安全检查已接入保存与解析链路，并在 0.6.0 升级为结构启发式；仍需注意它不能覆盖所有复杂正则。
 - annotated tag `v0.6.0`（tag object `589e35669d47f4b974160cb474def7d22f3b4228`）指向 `29b3dab5960ef9efd55a5123294f19ca17b38e7f`，发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.0
 - 已发布 v0.6.0 EXE 为 96,948,502 bytes，SHA-256：`44E769B707F6DDEB144B5994BF7674AE33FA9E64317243125387F615291A75D2`；远端三资产 digest 已核对。
+- v0.6.1 发布信息见 GitHub Release；发布后补充 tag、commit、EXE 大小与 SHA-256。
 
 交付时明确报告修改文件、实际执行的检查、构建产物哈希和未执行事项；不要把“语法可解析”表述成“GUI 功能已验证”。

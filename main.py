@@ -1,5 +1,6 @@
 import sys
 import os
+import argparse
 import codecs
 import re
 import json
@@ -417,7 +418,7 @@ def _is_regex_safe(pattern):
     except Exception:
         return False, 'regex structure is too complex to analyze safely'
 
-APP_VERSION = '0.6.0'
+APP_VERSION = '0.6.1'
 GITHUB_REPO_URL = 'https://github.com/FengBujue0104/SeavoExplorer/'
 GITHUB_RELEASES_URL = 'https://github.com/FengBujue0104/SeavoExplorer/releases'
 GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/FengBujue0104/SeavoExplorer/releases/latest'
@@ -3086,6 +3087,7 @@ class WizardDialog(QDialog):
             <p>左侧 <b>“新建项目文件夹”</b>：按规则创建新的 S/M 项目根目录。</p>
             <p>选中项目后的 <b>“新建文件夹内部结构”</b>：在项目内创建版本目录（如 <code>V01</code>）
             及 BOM / SCH / 物料 / 评审 / 信号测试 等标准子文件夹。</p>
+            <p><b>检查更新：</b>菜单 <b>帮助 → 检查更新</b>。若程序目录可写且新版本提供 SHA-256 digest，可直接“下载并更新”；程序会退出、替换原 EXE 并重新启动。自签名版本仍可能显示“未知发布者”。</p>
             <p>更详细的说明请见菜单 <b>帮助 → 使用帮助</b>。祝使用愉快！</p>
             '''
         ),
@@ -6594,17 +6596,20 @@ class MainWindow(QMainWindow):
             return True
         return False
 
-    def _ask_download_update(self, message):
+    def _ask_download_update(self, message, can_update=False):
         box = QMessageBox(self)
         box.setWindowTitle('发现新版本')
         box.setIcon(QMessageBox.Question)
         box.setText(message)
-        download_btn = box.addButton('下载更新', QMessageBox.AcceptRole)
+        update_btn = box.addButton('下载并更新', QMessageBox.AcceptRole) if can_update else None
+        download_btn = box.addButton('仅下载' if can_update else '下载更新', QMessageBox.ActionRole)
         browser_btn = box.addButton('浏览器打开', QMessageBox.ActionRole)
         box.addButton('取消', QMessageBox.RejectRole)
-        box.setDefaultButton(download_btn)
+        box.setDefaultButton(update_btn or download_btn)
         box.exec_()
         clicked = box.clickedButton()
+        if update_btn is not None and clicked == update_btn:
+            return 'update'
         if clicked == download_btn:
             return 'download'
         if clicked == browser_btn:
@@ -6621,6 +6626,72 @@ class MainWindow(QMainWindow):
         box.setDefaultButton(open_btn)
         box.exec_()
         return box.clickedButton() == open_btn
+
+    def _can_update_in_place(self):
+        """判断当前是否适合原地替换 EXE。"""
+        if not getattr(sys, 'frozen', False):
+            return False, '源码运行模式不支持自动替换'
+        target = os.path.abspath(sys.executable)
+        if not target.lower().endswith('.exe') or not os.path.isfile(target):
+            return False, '当前启动器不是可替换的 EXE'
+        target_dir = os.path.dirname(target)
+        try:
+            fd, probe = tempfile.mkstemp(prefix='.seavo-write-', dir=target_dir)
+            os.close(fd)
+            os.remove(probe)
+        except OSError as error:
+            return False, f'程序目录不可写：{error}'
+        return True, ''
+
+    def _get_update_temp_dir(self):
+        """返回专用的更新临时目录，并清理超过 7 天的旧文件。"""
+        update_dir = os.path.join(tempfile.gettempdir(), 'SeavoExplorer-update')
+        os.makedirs(update_dir, exist_ok=True)
+        now = time.time()
+        for name in os.listdir(update_dir):
+            path = os.path.join(update_dir, name)
+            try:
+                if os.path.isfile(path) and now - os.path.getmtime(path) > 7 * 86400:
+                    os.remove(path)
+            except OSError:
+                pass
+        return update_dir
+
+    def _ask_apply_update(self, downloaded_path, expected_sha256):
+        """确认并启动同 EXE 更新模式。"""
+        box = QMessageBox(self)
+        box.setWindowTitle('安装更新')
+        box.setIcon(QMessageBox.Question)
+        box.setText(
+            '更新文件已下载并通过完整性校验。\n\n'
+            '点击“立即更新并重启”后，程序会退出，由更新文件等待当前进程结束、'
+            '替换原程序并重新启动。\n\n'
+            '注意：当前自签名证书可能不被 Windows 信任，其他电脑仍可能显示'
+            '“未知发布者”提示。'
+        )
+        update_btn = box.addButton('立即更新并重启', QMessageBox.AcceptRole)
+        box.addButton('稍后', QMessageBox.RejectRole)
+        box.setDefaultButton(update_btn)
+        box.exec_()
+        if box.clickedButton() != update_btn:
+            return False
+        target = os.path.abspath(sys.executable)
+        command = [
+            downloaded_path,
+            '--apply-update',
+            '--target', target,
+            '--pid', str(os.getpid()),
+            '--sha256', str(expected_sha256 or ''),
+            '--relaunch',
+        ]
+        try:
+            subprocess.Popen(command, cwd=os.path.dirname(downloaded_path), close_fds=True)
+        except OSError as error:
+            QMessageBox.warning(self, '更新失败', f'无法启动更新程序：\n{error}')
+            return False
+        self.statusBar().showMessage('正在退出并应用更新...')
+        self.close()
+        return True
 
     def _download_update_asset(self, url, save_path, asset_name='', expected_size=0, expected_sha256=''):
         progress = QProgressDialog('正在下载更新...', '取消', 0, 0, self)
@@ -6777,22 +6848,47 @@ class MainWindow(QMainWindow):
             asset_line = f'更新文件：{asset_name}'
             if size_mb > 0:
                 asset_line += f'（{size_mb:.1f} MB）'
+            can_update, update_reason = self._can_update_in_place()
+            if can_update:
+                update_note = '\n可直接下载并更新（程序会退出、替换并重新启动）。'
+            else:
+                update_note = f'\n当前无法自动替换：{update_reason}。将只能下载新版本手动替换。'
             msg = (
                 f'发现新版本：{tag_name}\n'
                 f'当前版本：{APP_VERSION}\n'
                 f'{asset_line}\n'
-                f'发布页：{release_url}\n\n'
-                '是否下载更新文件？\n'
+                f'发布页：{release_url}\n'
+                f'{update_note}\n\n'
+                '是否继续？\n'
                 '如果下载失败，可以改用浏览器打开发布页下载。'
             )
-            action = self._ask_download_update(msg)
+            action = self._ask_download_update(msg, can_update)
             if action == 'browser':
                 self._open_url(release_url)
                 return
-            if action != 'download':
+            if action == 'cancel':
+                return
+            if action == 'update' and not asset_digest:
+                QMessageBox.warning(
+                    self, '无法自动更新',
+                    '该版本未提供 SHA-256 digest，无法安全地自动替换。\n'
+                    '请改用“仅下载”或浏览器下载。'
+                )
                 return
 
             default_name = self._versioned_exe_name(asset_name, tag_name)
+            if action == 'update':
+                save_path = os.path.join(self._get_update_temp_dir(), default_name)
+                downloaded_path = self._download_update_asset(
+                    asset.get('browser_download_url'), save_path,
+                    asset_name, asset_size, asset_digest,
+                )
+                if not downloaded_path:
+                    return
+                self.statusBar().showMessage(f'更新已下载: {downloaded_path}')
+                self._ask_apply_update(downloaded_path, asset_digest)
+                return
+
             default_path = os.path.join(self._get_download_default_dir(), default_name)
             save_path, _ = QFileDialog.getSaveFileName(self, '保存更新文件', default_path, '可执行文件 (*.exe)')
             if not save_path:
@@ -6836,9 +6932,9 @@ class MainWindow(QMainWindow):
         about_text = (
             '<h3>SeavoExplorer - 主板项目文件浏览器</h3>'
             f'<p>版本 {APP_VERSION}</p>'
-            '<p>本版本重点修复自定义项目正则的 ReDoS 风险（新增结构分析，保存与载入双向校验），'
-            '并改进文本预览编码/BOM、zip 打包、文件夹结构配置、失效根目录提示和 old/ 归档；'
-            '同时清理死代码与文档，提升稳定性与可维护性。</p>'
+            '<p>本版本新增同 EXE 自动更新（SHA-256 校验、退出后替换并重启）和自签名构建管线；'
+            '并保留 0.6.0 的自定义正则 ReDoS 防护、文本预览编码/BOM、zip 与稳定性修复。</p>'
+            '<p>当前发布使用自签名证书，Windows 可能仍提示“未知发布者”。</p>'
             f'<p>GitHub：<a href="{GITHUB_REPO_URL}">{GITHUB_REPO_URL}</a></p>'
         )
         # 关于页 logo 优先用高清 PNG 源（清晰放大），回退到多尺寸 ico
@@ -6895,9 +6991,11 @@ class MainWindow(QMainWindow):
 <h3 style="color: #2980b9;">二、检查更新与下载更新</h3>
 <ul>
 <li>点击 <b>帮助 → 检查更新</b>，程序会读取 GitHub Releases 上的最新版本并与当前版本比较。</li>
-<li>发现新版本时，弹窗会显示版本号、更新文件大小和发布页链接，可选择 <b>下载更新</b> 或 <b>浏览器打开</b>。</li>
+<li>发现新版本时，若程序目录可写且发布资产提供 SHA-256 digest，可选择 <b>下载并更新</b>：程序退出后由新 EXE 等待旧进程结束、替换原 EXE 并重新启动；失败时保留 <code>.old</code> 备份。</li>
+<li>若程序目录不可写（例如 Program Files）或发布资产没有 digest，只能选择 <b>仅下载</b> 后手动替换。</li>
 <li>程序内下载会在后台进行，进度窗口显示下载量、速度和预计剩余时间；网络中断时会自动重试，已有临时文件时会尽量断点续传。</li>
 <li>取消或网络失败时会保留 <code>.part</code> 临时文件以便稍后续传（失败提示会说明）；下载内容校验失败时会清理临时文件。</li>
+<li>当前发布使用自签名证书，Windows 可能仍提示“未知发布者”；请核对发布页提供的 SHA-256 和 manifest。</li>
 <li>如果 GitHub 连接较慢或下载失败，可使用弹窗中的发布页链接，在浏览器中手动下载最新 <code>SeavoExplorer.exe</code>。</li>
 </ul>
 
@@ -6963,7 +7061,7 @@ class MainWindow(QMainWindow):
 <p>单击文件树中的文件，下方预览区会自动显示内容：</p>
 <table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">
 <tr style="background: #ecf0f1;"><th>文件类型</th><th>支持格式</th><th>说明</th></tr>
-<tr><td>文本文件</td><td>.txt .csv .log .bom .drc .rep .rpt .md .json .xml .html .htm .ini .cfg</td><td>直接显示文本（UTF-8/GBK 自动识别）</td></tr>
+<tr><td>文本文件</td><td>.txt .csv .log .bom .drc .rep .rpt .md .json .xml .html .htm .ini .cfg</td><td>直接显示文本（UTF-8/GBK 自动识别，支持 BOM）</td></tr>
 <tr><td>PDF 文件</td><td>.pdf</td><td>预览前 3 页文本</td></tr>
 <tr><td>Excel 文件</td><td>.xlsx .xlsm .xls</td><td>表格形式预览</td></tr>
 <tr><td>Word 文件</td><td>.docx .doc</td><td>文档内容预览</td></tr>
@@ -7068,7 +7166,8 @@ class MainWindow(QMainWindow):
 <li><b>预览内容乱码</b>：文本预览会尝试 UTF-8 / GBK；若仍乱码，请用专业编辑器或对应软件打开原文件</li>
 </ul>
 <h3 style="color: #2980b9;">十四、关于更新</h3>
-<p>如果你使用“帮助 → 检查更新”，程序会优先尝试在应用内下载更新；若网络较慢或下载失败，可直接打开 GitHub Releases 页面用浏览器下载。</p>
+<p>如果你使用“帮助 → 检查更新”，程序会优先尝试在应用内下载更新。程序目录可写且发布资产带 SHA-256 digest 时，可直接“下载并更新”：程序退出后由新 EXE 替换原程序并重新启动；否则请下载后手动替换。若网络较慢或下载失败，可直接打开 GitHub Releases 页面用浏览器下载。</p>
+<p>当前发布使用自签名证书，Windows SmartScreen 仍可能提示“未知发布者”；正式发布建议使用公共可信的代码签名证书。</p>
 '''
         )
 
@@ -7310,7 +7409,195 @@ class MainWindow(QMainWindow):
         if not handled:
             event.ignore()
 
+
+_UPDATE_TEMP_DIR_NAME = 'SeavoExplorer-update'
+
+
+def _parse_update_arguments(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--apply-update', action='store_true')
+    parser.add_argument('--target')
+    parser.add_argument('--pid', type=int, default=0)
+    parser.add_argument('--sha256', default='')
+    parser.add_argument('--relaunch', action='store_true')
+    parser.add_argument('--no-relaunch', action='store_true')
+    parser.add_argument('--silent', action='store_true')
+    parser.add_argument('--wait-timeout', type=int, default=60)
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def _wait_for_process_exit(pid, timeout_seconds=60):
+    """等待指定 PID 退出；Windows 用 SYNCHRONIZE 句柄，避免 PID 复用误判。"""
+    if pid <= 0:
+        return True
+    if sys.platform != 'win32':
+        deadline = time.monotonic() + max(0, timeout_seconds)
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            time.sleep(0.2)
+        return False
+    from ctypes import wintypes
+    SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0x00000000
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+    if not handle:
+        return True
+    try:
+        return kernel32.WaitForSingleObject(
+            handle, int(max(0, timeout_seconds) * 1000)
+        ) == WAIT_OBJECT_0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _unique_backup_path(target):
+    base = target + '.old'
+    if not os.path.exists(base):
+        return base
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    candidate = base + '.' + stamp
+    sequence = 1
+    while os.path.exists(candidate):
+        candidate = base + '.' + stamp + '.%d' % sequence
+        sequence += 1
+    return candidate
+
+
+def _replace_executable(target, source, retries=5):
+    """把 source 替换到 target；优先 ReplaceFileW，失败退回备份+替换。"""
+    target = os.path.abspath(target)
+    source = os.path.abspath(source)
+    if not os.path.isfile(target):
+        return False, '目标文件不存在：%s' % target
+    if not os.path.isfile(source):
+        return False, '更新文件不存在：%s' % source
+    if os.path.normcase(target) == os.path.normcase(source):
+        return False, '目标文件与更新文件相同'
+    target_dir = os.path.dirname(target)
+    new_path = os.path.join(target_dir, '.SeavoExplorer-update-new.exe')
+    backup_path = _unique_backup_path(target)
+    last_error = ''
+    for _attempt in range(max(1, retries)):
+        try:
+            shutil.copy2(source, new_path)
+        except OSError as error:
+            last_error = '复制更新文件失败：%s' % error
+            time.sleep(0.5)
+            continue
+        if sys.platform == 'win32':
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.ReplaceFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID,
+            ]
+            kernel32.ReplaceFileW.restype = wintypes.BOOL
+            if kernel32.ReplaceFileW(target, new_path, backup_path, 0x1, None, None):
+                return True, ''
+            last_error = 'ReplaceFileW 失败（错误码 %s）' % kernel32.GetLastError()
+        try:
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+            os.replace(target, backup_path)
+            try:
+                os.replace(new_path, target)
+            except Exception:
+                os.replace(backup_path, target)
+                raise
+            return True, ''
+        except OSError as error:
+            last_error = str(error)
+            time.sleep(0.5)
+    try:
+        if os.path.exists(new_path):
+            os.remove(new_path)
+    except OSError:
+        pass
+    return False, last_error or '替换失败'
+
+
+def _relaunch_target(target):
+    subprocess.Popen([target], cwd=os.path.dirname(target), close_fds=True)
+
+
+def _show_update_error(message, silent=False):
+    if not silent:
+        try:
+            ctypes.windll.user32.MessageBoxW(0, str(message), 'SeavoExplorer 更新失败', 0x10)
+        except Exception:
+            pass
+    try:
+        log_path = os.path.join(tempfile.gettempdir(), 'SeavoExplorer-update.log')
+        with open(log_path, 'a', encoding='utf-8') as stream:
+            stream.write(time.strftime('%Y-%m-%d %H:%M:%S') + ' ' + str(message) + '\n')
+    except Exception:
+        pass
+
+
+def _run_update_mode(argv):
+    args = _parse_update_arguments(argv)
+    if not args.apply_update:
+        return None
+    if not getattr(sys, 'frozen', False):
+        _show_update_error('更新模式只能在打包后的 EXE 中运行', args.silent)
+        return 1
+    if not args.target:
+        _show_update_error('缺少 --target 参数', args.silent)
+        return 1
+    target = os.path.abspath(args.target)
+    source = os.path.abspath(sys.executable)
+    if not target.lower().endswith('.exe'):
+        _show_update_error('目标文件不是 EXE：%s' % target, args.silent)
+        return 1
+    if not os.path.isfile(target):
+        _show_update_error('目标文件不存在：%s' % target, args.silent)
+        return 1
+    if args.sha256:
+        actual = _file_sha256(source)
+        if actual.upper() != args.sha256.strip().upper():
+            _show_update_error(
+                '更新文件 SHA-256 校验失败：期望 %s，实际 %s' % (args.sha256, actual),
+                args.silent,
+            )
+            return 1
+    if not _wait_for_process_exit(args.pid, args.wait_timeout):
+        _show_update_error('等待旧进程退出超时（PID %s）' % args.pid, args.silent)
+        return 1
+    ok, error = _replace_executable(target, source)
+    if not ok:
+        _show_update_error('替换程序失败：%s' % error, args.silent)
+        return 1
+    if args.relaunch and not args.no_relaunch:
+        try:
+            _relaunch_target(target)
+        except OSError as error:
+            _show_update_error('更新成功，但重新启动失败：%s' % error, args.silent)
+            return 1
+    return 0
+
+
 if __name__ == '__main__':
+    update_exit = _run_update_mode(sys.argv[1:])
+    if update_exit is not None:
+        sys.exit(update_exit)
     try:
         app = QApplication(sys.argv)
         app.setAttribute(Qt.AA_DisableWindowContextHelpButton)

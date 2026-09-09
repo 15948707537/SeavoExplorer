@@ -1,8 +1,8 @@
 # SeavoExplorer 主板项目文件浏览器
 
-**版本 0.6.0**
+**版本 0.6.1**
 
-Windows 单文件版可从 [v0.6.0 Release](https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.0) 下载。发布页同时提供独立 SHA-256 文件和 build manifest；下载后应核对附件中的哈希。
+Windows 单文件版可从 [v0.6.1 Release](https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.1) 下载。发布页同时提供独立 SHA-256 文件和 build manifest；下载后应核对附件中的哈希。
 
 ---
 
@@ -60,6 +60,13 @@ SeavoExplorer 是一个 Windows 桌面工具，用于浏览以 S/M 编号命名�
 - 旧配置会在正常保存时自动迁移为统一路径格式
 - PDF、Excel、Word 和视频预览完成后会释放读取资源；重命名、归档或移入回收站前会清理当前预览，避免文件被 SeavoExplorer 占用
 - 「项目文件夹设置」默认窗口更大，路径表格至少显示四行
+
+#### 🆕 同 EXE 自动更新与代码签名管线（0.6.1）
+
+- 「帮助 → 检查更新」在程序目录可写且发布资产带 SHA-256 digest 时提供「下载并更新」：程序退出后由新 EXE 等待旧进程结束、替换原 EXE 并重新启动；失败时保留 `.old` 备份
+- 新增 `SEAVO_SIGN_MODE=store|pfx` 自签名/证书存储签名管线，manifest 记录 `code_signing`；`SEAVO_REQUIRE_SIGNING=1` 可作为发布门禁
+- 当前发布使用自签名证书，Windows SmartScreen 仍可能提示“未知发布者”；正式发布建议使用 SignPath Foundation 或商业 OV/EV 证书
+- 测试增加到 117 项
 
 #### 🆕 自定义正则与稳定性修复（0.6.0）
 
@@ -126,8 +133,10 @@ SeavoExplorer 是一个 Windows 桌面工具，用于浏览以 S/M 编号命名�
 ### 6. 检查更新
 
 - 点击「帮助 → 检查更新」即可从 GitHub Releases 检查最新版本
-- 新版本弹窗会显示版本号、更新文件大小和发布页链接，可选择应用内下载或用浏览器打开发布页
+- 程序目录可写且新版本提供 SHA-256 digest 时，弹窗提供「下载并更新」：程序退出后由新 EXE 等待旧进程结束、替换原 EXE 并重新启动
+- 程序目录不可写或缺少 digest 时只能「仅下载」，之后手动替换
 - 应用内下载支持后台进度显示、重试和断点续传
+- 当前发布使用自签名证书，Windows 可能提示「未知发布者」；请核对发布页的 SHA-256 和 manifest
 
 ### 7. 快捷访问栏
 
@@ -214,6 +223,12 @@ python -m venv .venv-build
 
 直接调用 spec 默认生成 onefile，但不会执行包装器提供的测试、产物 manifest 和冒烟流程，正式构建应优先使用 `build_onefile.py`。完整环境、校验和发布步骤见 `打包指南.txt`。
 
+### 代码签名
+
+- 当前发布使用自签名证书进行 Authenticode 签名，但证书未受公共信任，Windows SmartScreen 仍可能提示“未知发布者”。
+- 开发者可用 `.\make_self_signed_cert.ps1 -PfxPassword "<密码>"` 生成自签名证书，再按 `打包指南.txt` 设置 `SEAVO_SIGN_MODE=store` 构建签名版。
+- 正式发布建议使用 SignPath Foundation 或商业 OV/EV 证书。
+
 ### 开发验证
 
 ```powershell
@@ -222,7 +237,7 @@ python -m py_compile main.py test_safety.py test_tooling.py build_support.py bui
 git diff --check
 ```
 
-当前共 70 项 unittest：`test_safety.py` 的 47 项覆盖产品安全关键路径，`test_tooling.py` 的 23 项覆盖版本/哈希、严格构建环境、manifest、本地资产快照、onedir 完整遍历、环境净化、二进制来源及 GitHub 发布状态校验；它们不等同于完整 GUI 人工验收。
+当前共 117 项 unittest：`test_safety.py` 的 88 项覆盖产品安全关键路径，`test_tooling.py` 的 29 项覆盖版本/哈希、严格构建环境、manifest、本地资产快照、onedir 完整遍历、环境净化、二进制来源、代码签名及 GitHub 发布状态校验；它们不等同于完整 GUI 人工验收。
 
 ---
 
@@ -268,7 +283,9 @@ git diff --check
 ### 3. 更新下载慢或失败
 
 - 先在「帮助 → 检查更新」里尝试应用内下载
-- 如果网络较慢或 GitHub 下载不稳定，可直接打开发布页，用浏览器手动下载
+- 如果程序目录可写且下载文件带 SHA-256 digest，弹窗会提供「下载并更新」：程序退出后由更新文件等待旧进程结束、替换原 EXE 并重新启动
+- 如果程序目录不可写（例如 Program Files）或缺少 digest，只能「仅下载」后手动替换
+- 自签名或未签名版本在 Windows 上仍可能提示「未知发布者」；请核对发布页提供的 SHA-256 和 manifest
 - 断点续传会尽量利用已经下载的部分文件
 
 ### 4. 大目录加载慢

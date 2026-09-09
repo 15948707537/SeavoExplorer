@@ -110,7 +110,8 @@ dist/SeavoExplorer/
 - EXE 的 `FileVersion`、`ProductVersion`、`ProductName` 等 PE 信息由 spec 从 `main.py` 的 `APP_VERSION` 动态生成，不维护第二份 version resource。
 - `main.spec` 固定 `upx=False`，避免未来 PATH 中偶然出现 UPX 后改变产物和杀软表现。
 - `.rar` / `.7z` 依赖用户安装并授权的外部可信 `7z.exe`，不会打入 EXE；ZIP 使用 Python 标准库。
-- 当前没有 Authenticode 代码签名证书，EXE 未签名，Windows SmartScreen 可能提示。版本资源和 SHA-256 不能替代代码签名。
+- manifest 的 `code_signing` 记录签名模式、主体、指纹和验证状态；未签名时 `mode=none`。
+- 当前 0.6.1 使用自签名证书进行 Authenticode 签名，但证书未受公共信任；其他电脑仍可能显示 SmartScreen“未知发布者”。版本资源和 SHA-256 不能替代可信代码签名。
 
 ## 6. 发布前准备
 
@@ -134,11 +135,50 @@ git rev-list --left-right --count origin/main...HEAD
 
 要求：当前是 `main`、工作区完全干净、最后一条输出为 `0  0`，且 `origin` 指向 `FengBujue0104/SeavoExplorer`。
 
+### 代码签名（自签名；当前 0.6.1 使用）
+
+1. 生成自签名证书（`.signing/` 已加入 `.gitignore`，私钥不要提交）：
+
+```powershell
+.\make_self_signed_cert.ps1 -PfxPassword "<PFX密码>"
+```
+
+脚本会输出证书指纹，并生成 `SeavoExplorer-dev.cer` / `SeavoExplorer-dev.pfx`。
+
+2. 用证书存储模式签名并构建：
+
+```powershell
+$env:SEAVO_SIGN_MODE="store"
+$env:SEAVO_SIGN_CERT_SHA1="<证书指纹>"
+$env:SEAVO_SIGN_TIMESTAMP_URL="http://timestamp.digicert.com"
+$env:SEAVO_SIGN_ALLOW_UNTRUSTED="1"
+.\.venv-build\Scripts\python.exe build_onefile.py
+```
+
+3. 检查签名：
+
+```powershell
+Get-AuthenticodeSignature .\dist\SeavoExplorer.exe | Format-List *
+signtool verify /pa /all /v .\dist\SeavoExplorer.exe
+```
+
+- `Status=Valid`：当前机器信任该证书。
+- `Status=UnknownError` / `NotTrusted`：签名已存在，但证书未受信任；自签名在其他电脑上会这样。
+- 当前 0.6.1 发布使用 `SEAVO_SIGN_ALLOW_UNTRUSTED=1`；它只表示“允许未受信任的自签名证书”，不会让 Windows 信任发布者。正式发布应使用公共可信证书并设为 `0`。
+
+4. 发布门禁（可选）：
+
+```powershell
+$env:SEAVO_REQUIRE_SIGNING="1"
+```
+
+开启后 `release.py` 会拒绝 `code_signing.signed` 不为 true 的 manifest。
+
 ## 7. 创建 GitHub Release
 
 需要 GitHub CLI 2.94.0 或更高版本，并先执行 `gh auth login`。发布脚本必须用上述严格构建 venv 的 Python 运行。
 
-已发布版本不可重复发布；当前发布使用 `v0.6.0`：
+已发布版本不可重复发布；当前发布使用 `v0.6.1`：
 
 ```powershell
 .\.venv-build\Scripts\python.exe release.py vX.Y.Z

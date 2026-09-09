@@ -137,6 +137,193 @@ def file_sha256(path):
     return digest.hexdigest().upper()
 
 
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _find_signtool():
+    explicit = os.environ.get('SEAVO_SIGNTOOL', '').strip()
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise BuildError('SEAVO_SIGNTOOL 指向的文件不存在：{}'.format(explicit))
+        return explicit
+    roots = [
+        os.path.join(
+            os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+            'Windows Kits', '10', 'bin',
+        ),
+        os.path.join(
+            os.environ.get('ProgramFiles', r'C:\Program Files'),
+            'Windows Kits', '10', 'bin',
+        ),
+    ]
+    candidates = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            path = os.path.join(root, name, 'x64', 'signtool.exe')
+            if os.path.isfile(path):
+                candidates.append((name, path))
+    if not candidates:
+        raise BuildError('未找到 signtool.exe；请安装 Windows SDK 或设置 SEAVO_SIGNTOOL')
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def signing_config():
+    mode = os.environ.get('SEAVO_SIGN_MODE', 'none').strip().lower() or 'none'
+    config = {
+        'mode': mode,
+        'signed': False,
+        'verified': False,
+        'trusted': False,
+        'self_signed': False,
+        'subject': '',
+        'thumbprint': '',
+        'status': '',
+        'timestamp_subject': '',
+        'timestamp_url': os.environ.get('SEAVO_SIGN_TIMESTAMP_URL', '').strip(),
+        'allow_untrusted': _env_flag('SEAVO_SIGN_ALLOW_UNTRUSTED', False),
+        'required': _env_flag('SEAVO_REQUIRE_SIGNING', False),
+    }
+    if mode == 'none':
+        return config
+    if mode not in ('store', 'pfx'):
+        raise BuildError('SEAVO_SIGN_MODE 只能是 none/store/pfx，当前为：{}'.format(mode))
+    config['signtool'] = _find_signtool()
+    if mode == 'store':
+        thumbprint = os.environ.get('SEAVO_SIGN_CERT_SHA1', '').strip()
+        if not thumbprint:
+            raise BuildError('store 签名模式必须设置 SEAVO_SIGN_CERT_SHA1')
+        config['thumbprint'] = thumbprint.replace(' ', '').upper()
+        config['machine_store'] = _env_flag('SEAVO_SIGN_MACHINE_STORE', False)
+    else:
+        pfx = os.environ.get('SEAVO_SIGN_PFX', '').strip()
+        if not pfx or not os.path.isfile(pfx):
+            raise BuildError('pfx 签名模式必须设置有效的 SEAVO_SIGN_PFX')
+        config['pfx'] = os.path.abspath(pfx)
+        config['pfx_password'] = os.environ.get('SEAVO_SIGN_PFX_PASSWORD', '')
+    return config
+
+
+def _powershell_executable():
+    system_root = os.environ.get('SystemRoot', r'C:\Windows')
+    path = os.path.join(
+        system_root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'
+    )
+    if not os.path.isfile(path):
+        raise BuildError('未找到 Windows PowerShell：{}'.format(path))
+    return path
+
+
+def signature_info(path):
+    """读取 Authenticode 签名状态、主体、指纹和时间戳主体。"""
+    escaped = os.path.abspath(path).replace("'", "''")
+    script = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "$sig = Get-AuthenticodeSignature -LiteralPath '{}'; "
+        "$cert = $sig.SignerCertificate; "
+        "[PSCustomObject]@{{"
+        "Status=[string]$sig.Status; "
+        "Subject=if ($cert) {{ $cert.Subject }} else {{ '' }}; "
+        "Thumbprint=if ($cert) {{ $cert.Thumbprint }} else {{ '' }}; "
+        "SelfSigned=if ($cert) {{ $cert.Subject -eq $cert.Issuer }} else {{ $false }}; "
+        "TimestampSubject=if ($sig.TimeStamperCertificate) {{ $sig.TimeStamperCertificate.Subject }} else {{ '' }}"
+        "}} | ConvertTo-Json -Compress"
+    ).format(escaped)
+    result = run_command(
+        [_powershell_executable(), '-NoProfile', '-NonInteractive', '-Command', script],
+        capture=True,
+    )
+    try:
+        info = json.loads(result.stdout or '{}')
+    except json.JSONDecodeError as error:
+        raise BuildError('无法解析 Authenticode 签名信息') from error
+    return {
+        'status': str(info.get('Status') or ''),
+        'subject': str(info.get('Subject') or ''),
+        'thumbprint': str(info.get('Thumbprint') or ''),
+        'self_signed': bool(info.get('SelfSigned')),
+        'timestamp_subject': str(info.get('TimestampSubject') or ''),
+    }
+
+
+def sign_executable(path, config=None):
+    """使用 signtool 对 EXE 做 Authenticode 签名，并读取签名结果。"""
+    config = dict(config or signing_config())
+    if config.get('mode') == 'none':
+        return config
+    signtool = config['signtool']
+    command = [signtool, 'sign', '/fd', 'SHA256']
+    redacted = [signtool, 'sign', '/fd', 'SHA256']
+    if config['mode'] == 'store':
+        if config.get('machine_store'):
+            command.append('/sm')
+            redacted.append('/sm')
+        command.extend(['/sha1', config['thumbprint']])
+        redacted.extend(['/sha1', config['thumbprint']])
+    else:
+        command.extend(['/f', config['pfx'], '/p', config['pfx_password']])
+        redacted.extend(['/f', config['pfx'], '/p', '********'])
+    timestamp_url = config.get('timestamp_url')
+    if timestamp_url:
+        command.extend(['/tr', timestamp_url, '/td', 'SHA256'])
+        redacted.extend(['/tr', timestamp_url, '/td', 'SHA256'])
+    command.append(path)
+    redacted.append(path)
+    run_command(command, display_command=_display_command(redacted))
+    info = signature_info(path)
+    config.update({
+        'signed': bool(info.get('subject')),
+        'verified': info.get('status') == 'Valid',
+        'trusted': info.get('status') == 'Valid',
+        'self_signed': info.get('self_signed', False),
+        'subject': info.get('subject', ''),
+        'thumbprint': info.get('thumbprint', '') or config.get('thumbprint', ''),
+        'status': info.get('status', ''),
+        'timestamp_subject': info.get('timestamp_subject', ''),
+    })
+    if not config['signed']:
+        raise BuildError('签名后未检测到 Authenticode 签名：{}'.format(path))
+    if not config['verified'] and not config['allow_untrusted']:
+        raise BuildError('Authenticode 签名验证失败（{}）：{}'.format(config['status'], path))
+    return config
+
+
+def sign_distribution_entrypoint(entrypoint):
+    config = signing_config()
+    if config['mode'] == 'none':
+        print('[签名] 未启用（SEAVO_SIGN_MODE=none）', flush=True)
+        return config
+    print('[签名] 模式：{}'.format(config['mode']), flush=True)
+    return sign_executable(entrypoint, config)
+
+
+def validate_code_signing(code_signing, require_signed=None, allow_untrusted=None):
+    """校验 manifest.code_signing 是否符合发布策略。"""
+    if not isinstance(code_signing, dict):
+        raise BuildError('manifest.code_signing 必须是 JSON object')
+    mode = code_signing.get('mode')
+    if mode not in ('none', 'store', 'pfx'):
+        raise BuildError('manifest.code_signing.mode 非法：{}'.format(mode))
+    if require_signed is None:
+        require_signed = _env_flag('SEAVO_REQUIRE_SIGNING', False)
+    if allow_untrusted is None:
+        allow_untrusted = _env_flag('SEAVO_SIGN_ALLOW_UNTRUSTED', False)
+    if mode == 'none':
+        if require_signed:
+            raise BuildError('发布要求代码签名，但 manifest 显示未签名')
+        return
+    if code_signing.get('signed') is not True:
+        raise BuildError('manifest.code_signing.signed 不是 true')
+    if code_signing.get('verified') is not True and not allow_untrusted:
+        raise BuildError('manifest.code_signing.verified 不是 true，且未允许未受信任证书')
+
+
 def _display_command(command):
     try:
         return subprocess.list2cmdline(command)
@@ -144,8 +331,9 @@ def _display_command(command):
         return ' '.join(str(part) for part in command)
 
 
-def run_command(command, *, capture=False, check=True, env=None, cwd=ROOT_DIR):
-    print('>', _display_command(command), flush=True)
+def run_command(command, *, capture=False, check=True, env=None, cwd=ROOT_DIR, display_command=None):
+    shown_command = display_command if display_command is not None else _display_command(command)
+    print('>', shown_command, flush=True)
     result = subprocess.run(
         command,
         cwd=cwd,
@@ -161,7 +349,7 @@ def run_command(command, *, capture=False, check=True, env=None, cwd=ROOT_DIR):
             details = (result.stderr or result.stdout or '').strip()
         message = '命令失败（退出码 {}）：{}'.format(
             result.returncode,
-            _display_command(command),
+            shown_command,
         )
         if details:
             message += '\n' + details
@@ -1036,6 +1224,7 @@ def write_build_outputs(
     audit,
     checks,
     environment_verified,
+    code_signing=None,
 ):
     target = BUILD_TARGETS[target_name]
     manifest_path = os.path.join(ROOT_DIR, target['manifest'])
@@ -1063,6 +1252,17 @@ def write_build_outputs(
         'inputs_sha256': _input_hashes(),
         'checks': checks,
         'binary_source_audit': audit,
+        'code_signing': code_signing or {
+            'mode': 'none',
+            'signed': False,
+            'verified': False,
+            'trusted': False,
+            'self_signed': False,
+            'subject': '',
+            'thumbprint': '',
+            'status': 'NotSigned',
+            'timestamp_subject': '',
+        },
         'artifact': artifact,
     }
     _write_json_atomic(manifest_path, manifest)
@@ -1102,6 +1302,20 @@ def validate_release_artifacts(expected_version, expected_commit, require_clean=
     checks = _require_mapping(manifest.get('checks'), 'manifest.checks')
     audit = _require_mapping(manifest.get('binary_source_audit'), 'manifest.binary_source_audit')
     artifact = _require_mapping(manifest.get('artifact'), 'manifest.artifact')
+    code_signing = _require_mapping(
+        manifest.get('code_signing', {
+            'mode': 'none',
+            'signed': False,
+            'verified': False,
+            'trusted': False,
+            'self_signed': False,
+            'subject': '',
+            'thumbprint': '',
+            'status': 'NotSigned',
+            'timestamp_subject': '',
+        }),
+        'manifest.code_signing',
+    )
 
     actual_digest = file_sha256(artifact_path)
     actual_size = os.path.getsize(artifact_path)
@@ -1135,6 +1349,10 @@ def validate_release_artifacts(expected_version, expected_commit, require_clean=
     ]
     if require_clean and source.get('dirty') is not False:
         mismatches.append('manifest 显示构建时工作区不是干净状态')
+    try:
+        validate_code_signing(code_signing)
+    except BuildError as error:
+        mismatches.append(str(error))
 
     expected_distributions = _exact_build_requirements()
     distributions = environment.get('distributions')
@@ -1208,6 +1426,8 @@ def build_distribution(
     if not os.path.isfile(entrypoint) or os.path.getsize(entrypoint) == 0:
         raise BuildError('PyInstaller 未生成预期启动器：{}'.format(target['entrypoint']))
 
+    code_signing = sign_distribution_entrypoint(entrypoint)
+
     audit = audit_analysis_toc()
     if not skip_smoke:
         smoke_test_distribution(target_name)
@@ -1221,6 +1441,8 @@ def build_distribution(
         'pyinstaller': True,
         'binary_source_audit': True,
         'isolated_exe_smoke': None if skip_smoke else True,
+        'code_signing': None if code_signing.get('mode') == 'none' else bool(code_signing.get('signed')),
+        'code_signing_verified': None if code_signing.get('mode') == 'none' else bool(code_signing.get('verified') or code_signing.get('allow_untrusted')),
     }
     manifest = write_build_outputs(
         target_name,
@@ -1231,6 +1453,7 @@ def build_distribution(
         audit,
         checks,
         environment_verified,
+        code_signing=code_signing,
     )
     artifact_data = manifest['artifact']
     print()
@@ -1239,6 +1462,9 @@ def build_distribution(
     print(' 产物：{}'.format(target['artifact']))
     print(' 大小：{:.1f} MiB'.format(artifact_data['size'] / 1024 / 1024))
     print(' SHA-256：{}'.format(artifact_data['sha256']))
+    print(' 签名：{}'.format(
+        '已签名（{}）'.format(code_signing.get('status')) if code_signing.get('signed') else '未签名'
+    ))
     print(' Manifest：{}'.format(target['manifest']))
     print('=' * 56)
     return manifest

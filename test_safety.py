@@ -1463,6 +1463,79 @@ class DocumentationConsistencyTests(unittest.TestCase):
         self.assertIsNone(main._validate_windows_filename('CLOCK$'))
         self.assertIsNotNone(main._validate_windows_filename('CON'))
 
+class UpdateModeTests(unittest.TestCase):
+    def test_parse_update_arguments(self):
+        args = main._parse_update_arguments([
+            '--apply-update',
+            '--target', r'C:\app\SeavoExplorer.exe',
+            '--pid', '123',
+            '--sha256', 'ABC',
+            '--no-relaunch',
+            '--silent',
+        ])
+        self.assertTrue(args.apply_update)
+        self.assertEqual(args.target, r'C:\app\SeavoExplorer.exe')
+        self.assertEqual(args.pid, 123)
+        self.assertEqual(args.sha256, 'ABC')
+        self.assertTrue(args.no_relaunch)
+        self.assertTrue(args.silent)
+
+    def test_non_update_arguments_do_not_enter_update_mode(self):
+        args = main._parse_update_arguments(['--foo'])
+        self.assertFalse(args.apply_update)
+        self.assertIsNone(main._run_update_mode(['--foo']))
+
+    def test_update_mode_rejects_source_runtime(self):
+        with mock.patch.object(main.sys, 'frozen', False, create=True):
+            self.assertEqual(
+                main._run_update_mode([
+                    '--apply-update', '--target', 'target.exe', '--silent'
+                ]),
+                1,
+            )
+
+    def test_wait_for_process_exit_returns_after_exit(self):
+        process = subprocess.Popen(
+            [sys.executable, '-c', 'import time; time.sleep(0.5)']
+        )
+        try:
+            self.assertTrue(main._wait_for_process_exit(process.pid, 5))
+        finally:
+            process.wait(timeout=5)
+
+    def test_replace_executable_with_backup(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, 'target.exe')
+            source = os.path.join(root, 'source.exe')
+            with open(target, 'wb') as stream:
+                stream.write(b'OLD')
+            with open(source, 'wb') as stream:
+                stream.write(b'NEW')
+            ok, error = main._replace_executable(target, source)
+            self.assertTrue(ok, error)
+            with open(target, 'rb') as stream:
+                self.assertEqual(stream.read(), b'NEW')
+            backups = [name for name in os.listdir(root) if '.old' in name]
+            self.assertEqual(len(backups), 1)
+            with open(os.path.join(root, backups[0]), 'rb') as stream:
+                self.assertEqual(stream.read(), b'OLD')
+
+    def test_replace_executable_rejects_same_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'same.exe')
+            with open(path, 'wb') as stream:
+                stream.write(b'X')
+            ok, error = main._replace_executable(path, path)
+            self.assertFalse(ok)
+            self.assertIn('相同', error)
+
+    def test_can_update_in_place_false_for_source_mode(self):
+        window = SimpleNamespace()
+        with mock.patch.object(main.sys, 'frozen', False, create=True):
+            can_update, reason = main.MainWindow._can_update_in_place(window)
+        self.assertFalse(can_update)
+        self.assertIn('源码', reason)
+
 
 if __name__ == '__main__':
     unittest.main()

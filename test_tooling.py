@@ -577,6 +577,82 @@ class ReleaseStateTests(unittest.TestCase):
                 {'allowed.exe'},
             )
 
+class CodeSigningTests(unittest.TestCase):
+    def test_signing_config_defaults_to_none(self):
+        with mock.patch.dict(os.environ, {'SEAVO_SIGN_MODE': 'none'}, clear=False):
+            config = build_support.signing_config()
+        self.assertEqual(config['mode'], 'none')
+        self.assertFalse(config['signed'])
+
+    def test_signing_config_rejects_unknown_mode(self):
+        with mock.patch.dict(os.environ, {'SEAVO_SIGN_MODE': 'magic'}, clear=False):
+            with self.assertRaises(build_support.BuildError):
+                build_support.signing_config()
+
+    def test_signing_config_requires_thumbprint_for_store(self):
+        with mock.patch.dict(os.environ, {
+            'SEAVO_SIGN_MODE': 'store',
+            'SEAVO_SIGN_CERT_SHA1': '',
+        }, clear=False):
+            with mock.patch.object(build_support, '_find_signtool', return_value='signtool.exe'):
+                with self.assertRaises(build_support.BuildError):
+                    build_support.signing_config()
+
+    def test_pfx_sign_command_redacts_password(self):
+        with tempfile.TemporaryDirectory() as root:
+            pfx = os.path.join(root, 'cert.pfx')
+            with open(pfx, 'wb') as stream:
+                stream.write(b'pfx')
+            config = {
+                'mode': 'pfx',
+                'signtool': 'signtool.exe',
+                'pfx': pfx,
+                'pfx_password': 'super-secret',
+                'timestamp_url': 'http://timestamp.example',
+            }
+            with mock.patch.object(build_support, 'run_command') as run:
+                with mock.patch.object(build_support, 'signature_info', return_value={
+                    'status': 'Valid',
+                    'subject': 'CN=Test',
+                    'thumbprint': 'ABC',
+                    'self_signed': False,
+                    'timestamp_subject': 'TSA',
+                }):
+                    result = build_support.sign_executable('app.exe', config)
+            command = run.call_args.args[0]
+            display = run.call_args.kwargs['display_command']
+            self.assertIn('super-secret', command)
+            self.assertNotIn('super-secret', display)
+            self.assertIn('********', display)
+            self.assertTrue(result['signed'])
+            self.assertTrue(result['verified'])
+
+    def test_validate_code_signing_policy(self):
+        build_support.validate_code_signing(
+            {'mode': 'none', 'signed': False}, require_signed=False, allow_untrusted=False)
+        with self.assertRaises(build_support.BuildError):
+            build_support.validate_code_signing(
+                {'mode': 'none', 'signed': False}, require_signed=True, allow_untrusted=False)
+        build_support.validate_code_signing(
+            {'mode': 'store', 'signed': True, 'verified': False},
+            require_signed=True,
+            allow_untrusted=True,
+        )
+        with self.assertRaises(build_support.BuildError):
+            build_support.validate_code_signing(
+                {'mode': 'store', 'signed': True, 'verified': False},
+                require_signed=True,
+                allow_untrusted=False,
+            )
+
+    def test_find_signtool_prefers_explicit_env(self):
+        with tempfile.TemporaryDirectory() as root:
+            tool = os.path.join(root, 'signtool.exe')
+            with open(tool, 'wb') as stream:
+                stream.write(b'x')
+            with mock.patch.dict(os.environ, {'SEAVO_SIGNTOOL': tool}, clear=False):
+                self.assertEqual(build_support._find_signtool(), tool)
+
 
 if __name__ == '__main__':
     unittest.main()
