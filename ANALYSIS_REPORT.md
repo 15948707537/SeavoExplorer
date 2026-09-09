@@ -63,6 +63,7 @@
 - 新增同 EXE 更新模式：`--apply-update` 等待旧 PID 退出，用 `ReplaceFileW` 替换并保留 `.old` 备份，主程序提供“下载并更新”入口。
 - 测试增至 117 项；当前发布使用自签名证书，Windows SmartScreen 仍可能提示“未知发布者”。
 - v0.6.1 发布：tag `v0.6.1`（tag object `a7929378bebcd0061e4208ec3eab5799f45c8e72`）指向 `4b47e2d18673e7c1de1cffb79ac4c3334f5bc1db`；EXE 96,963,776 bytes，SHA-256 `994D7CBF7D3141BB532C2CAA7740AC7535ABD4BF17DC0F25AC6C8209F70D6001`；发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.1
+- v0.6.2 发布：tag `v0.6.2`（tag object `ec78efbd281582726303de00dc8a182f89d5e039`）指向 `acc54cdd4a06207ef2e23a97092fe4e7257ce1c5`；EXE 96,963,888 bytes，SHA-256 `6B730DD639F2BBAA1149C76975A8E4E0E56BD62C4EA2A02F339413A426842234`；该版本仅修改版本号，用于验证 0.6.1 → 0.6.2 更新流程。
 
 ### 其他更正
 

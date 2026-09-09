@@ -170,5 +170,7 @@ git status --short
 - 已发布 v0.6.0 EXE 为 96,948,502 bytes，SHA-256：`44E769B707F6DDEB144B5994BF7674AE33FA9E64317243125387F615291A75D2`；远端三资产 digest 已核对。
 - annotated tag `v0.6.1`（tag object `a7929378bebcd0061e4208ec3eab5799f45c8e72`）指向 `4b47e2d18673e7c1de1cffb79ac4c3334f5bc1db`，发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.1
 - 已发布 v0.6.1 EXE 为 96,963,776 bytes，SHA-256：`994D7CBF7D3141BB532C2CAA7740AC7535ABD4BF17DC0F25AC6C8209F70D6001`；使用自签名证书，远端三资产 digest 已核对。
+- annotated tag `v0.6.2`（tag object `ec78efbd281582726303de00dc8a182f89d5e039`）指向 `acc54cdd4a06207ef2e23a97092fe4e7257ce1c5`，发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.2
+- 已发布 v0.6.2 EXE 为 96,963,888 bytes，SHA-256：`6B730DD639F2BBAA1149C76975A8E4E0E56BD62C4EA2A02F339413A426842234`；该版本仅修改版本号，用于验证 0.6.1 → 0.6.2 更新流程。
 
 交付时明确报告修改文件、实际执行的检查、构建产物哈希和未执行事项；不要把“语法可解析”表述成“GUI 功能已验证”。
