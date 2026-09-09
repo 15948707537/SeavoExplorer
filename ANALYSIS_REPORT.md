@@ -13,7 +13,7 @@
 ## 审查更正与修复状态（2026-09-09）
 
 > 本节由新一轮复审补充，优先级高于下方 2026-08-31 的历史结论。
-> 代码修复将随 v0.6.0 发布；下方测试构建哈希为提交前工作树产物，最终发布产物以 GitHub Release 为准。
+> 代码修复已随 v0.6.0 发布；下方测试构建哈希为提交前工作树产物，最终发布产物以 GitHub Release 为准。
 
 ### 结论更正
 
@@ -49,8 +49,13 @@
   - `dist/SeavoExplorer.exe`，**96,948,767 bytes / 92.46 MiB**
   - SHA-256：**F5D487EC3B58987665A3AF577044473B96A0E377EA31A228EA8666BC7F4ECBAE**
   - manifest：`strict_environment=true`、`path_sanitized=true`、`external_binary_count=0`，全部 8 项检查为 true（含隔离冒烟）
-  - **`source.dirty=true`**：这是提交前工作树的测试构建；v0.6.0 的 clean 发布构建、tag 与远端资产 digest 将在发布完成后补充。
-- v0.6.0 的 commit/push/tag/Release 状态将在发布完成后补充。
+  - **`source.dirty=true`**：这是提交前工作树的测试构建，EXE SHA-256 为 `F5D487EC3B58987665A3AF577044473B96A0E377EA31A228EA8666BC7F4ECBAE`，仅用于本地验证，已被 clean 发布构建取代。
+- **v0.6.0 正式发布（2026-09-09）**：
+  - commit `29b3dab5960ef9efd55a5123294f19ca17b38e7f`，annotated tag `v0.6.0`（tag object `589e35669d47f4b974160cb474def7d22f3b4228`）
+  - clean 发布构建：`dist/SeavoExplorer.exe` **96,948,502 bytes**，SHA-256 **44E769B707F6DDEB144B5994BF7674AE33FA9E64317243125387F615291A75D2**
+  - manifest `source.dirty=false`、`strict_environment=true`、`path_sanitized=true`、`external_binary_count=0`，全部 8 项检查为 true
+  - GitHub Release：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.0
+  - 远端三资产（EXE、`.sha256`、`.build.json`）digest 已核对；独立下载 EXE 复核哈希一致。
 
 ### 其他更正
 

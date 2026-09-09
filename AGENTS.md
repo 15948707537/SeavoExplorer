@@ -159,6 +159,7 @@ git status --short
 - draft→三资产 digest 核验→publish 自动化已随 v0.5.1 完成首次真实 GitHub 端到端发布；三个远端资产均已核对 digest。
 - 新构建会写入 PE FileVersion/ProductVersion；这不等于 Authenticode 签名。当前没有签名证书。
 - 自定义正则安全检查已接入保存与解析链路，并在 0.6.0 升级为结构启发式；仍需注意它不能覆盖所有复杂正则。
-- v0.6.0 发布信息见 GitHub Release；发布后补充 tag、commit、EXE 大小与 SHA-256。
+- annotated tag `v0.6.0`（tag object `589e35669d47f4b974160cb474def7d22f3b4228`）指向 `29b3dab5960ef9efd55a5123294f19ca17b38e7f`，发布页：https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.0
+- 已发布 v0.6.0 EXE 为 96,948,502 bytes，SHA-256：`44E769B707F6DDEB144B5994BF7674AE33FA9E64317243125387F615291A75D2`；远端三资产 digest 已核对。
 
 交付时明确报告修改文件、实际执行的检查、构建产物哈希和未执行事项；不要把“语法可解析”表述成“GUI 功能已验证”。
