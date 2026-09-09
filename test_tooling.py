@@ -356,6 +356,11 @@ class PathAndHashTests(unittest.TestCase):
 
 
 class ManifestValidationTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {'SEAVO_REQUIRE_SIGNING': '0'}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_valid_manifest_is_accepted(self):
         with release_manifest_fixture() as fixture:
             manifest = build_support.validate_release_artifacts(

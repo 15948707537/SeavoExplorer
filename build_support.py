@@ -799,6 +799,8 @@ def run_source_checks(skip_tests=False):
     if not skip_tests:
         test_env = python_env.copy()
         test_env['QT_QPA_PLATFORM'] = 'offscreen'
+        # 发布门禁变量只约束产物校验，不应改变单元测试夹具的语义
+        test_env.pop('SEAVO_REQUIRE_SIGNING', None)
         run_command(
             [
                 sys.executable,
