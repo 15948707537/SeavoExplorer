@@ -1,12 +1,61 @@
 # SeavoExplorer 代码分析报告
 
-- 分析对象：`SeavoExplorer` @ `d2b8857`（`APP_VERSION = 0.5.4`）
-- 分析方式：源码通读 + 运行时实测（临时目录、回环 HTTP、子进程隔离），**全程只读**
-- 报告生成日期：2026-08-31
-- 未执行：GUI 端到端验证、PyInstaller 构建/冒烟/哈希、远端发布
+- 分析对象：`SeavoExplorer` @ `d2b8857`（当时 `APP_VERSION = 0.5.4`；修复后发布版本为 0.6.0）
+- 分析方式：源码通读 + 运行时实测（临时目录、回环 HTTP、子进程隔离）；2026-08-31 分析全程只读，2026-09-09 增补节包含修复与构建
+- 报告生成日期：2026-08-31（2026-09-09 增补复审与修复状态）
+- 未执行：GUI 端到端验证、远端发布；严格 venv 构建/冒烟/哈希已在 2026-09-09 增补节执行
 
 > 本报告只描述事实与可复现的实测结果。所有"缺陷"均给出触发路径与实测数据；
 > 所有"已验证正确"项同样给出实测数据，避免只报问题不报结论。
+
+---
+
+## 审查更正与修复状态（2026-09-09）
+
+> 本节由新一轮复审补充，优先级高于下方 2026-08-31 的历史结论。
+> 代码修复将随 v0.6.0 发布；下方测试构建哈希为提交前工作树产物，最终发布产物以 GitHub Release 为准。
+
+### 结论更正
+
+| 原结论 | 复审更正 |
+| --- | --- |
+| F1 只说"载入侧无校验"，修复建议是复用保存期校验 | **保存期启发式本身可被 `{m,n}` 绕过**：`^S(\d{1,2})+$` 会被设置对话框接受并持久化，扫描 36 字符目录名耗时 5.166s；灾难性回溯持有 GIL，主线程 Python 定时器/槽无法执行，`closeEvent` 的 `os._exit(0)` 兜底不可依赖。F1 仍为 P1，但触发条件从"手改配置"扩大为 **UI 可达**，修复不能只做载入侧复用。 |
+| F2 建议"UTF-8 优先，双向严格更优" | **不成立**：1920 个 GBK 双字节序列同时是合法 UTF-8；常用汉字中 20/136 存在歧义（一、为、之、说、也、时、要、没、去、学、然、写、目、原、图、录、硬、模、协、准）。固定顺序只是权衡，因此改为 BOM + 乱码启发式。 |
+| F3 定为 P2，称部分解压器会告警/覆盖 | 重复条目属实，但 Python `zipfile.testzip()` 返回 `None`、7-Zip `t` 退出码 0"Everything is Ok"；应降为 P3/P4 的产物质量问题。 |
+| F4 称列表形态抛 `.items`、旧配置导致崩溃 | 部分字典不一致在真实构造路径下属实；列表形态实际抛 `'list' object has no attribute 'get'`；git 历史显示首个提交即为 dict，**没有"旧配置"证据**，只能算手改/损坏配置。 |
+| F6 称 DirectConnection 与 closeEvent 快照构成竞态 | worker 线程执行属实，但 `list()`/`list.remove()` 受 GIL 保护，未发现实际故障；DirectConnection 还能在主事件循环阻塞时及时清理僵尸列表。保留实现并加注释，不按原建议改 AutoConnection。 |
+| F7 称非本地 URL 吞掉内部缓存、Ctrl+V 失效 | 属于**设计选择**：系统剪贴板一旦带 URL 说明用户已替换剪贴板，继续用旧内部路径会粘贴错文件。保留行为并新增测试固定该语义。 |
+
+### 本轮修复
+
+- **P1 正则安全**：新增结构分析器，覆盖 `{m,n}` 量词、嵌套重复组、回溯引用；`_resolve_regex` 对自定义正则复用保存期校验并回退默认；`load_settings` 对无效自定义正则追加启动警告；条件组等无法安全分析的结构 fail-closed。
+- **预览编码**：改为 BOM 识别 + UTF-8 优先 + GBK 乱码启发式；BOM 不再泄漏；大文件仍截断并有提示。
+- **zip**：删除重复目录条目写入，产物不再出现 `Duplicate name`。
+- **folder_structure**：新增 `_normalize_folder_structure`，载入与对话框统一归一化；部分字典、列表、非 dict、非法版本、非字符串自定义目录均安全处理。
+- **失效根目录**：`FolderStatsThread`/`FileSearchThread` 在 root 不存在时发出 error 信号，不再静默显示 0。
+- **old/ 守卫**：已在 `old/` 内或目录本身名为 `old` 的项目跳过归档，避免 `old/old` 嵌套。
+- **文档与清理**：帮助章节重新编号；PDF 文案改为"预览前 3 页文本"；README 修正"至少 1 个捕获组"和 ReDoS 启发式表述；移除 `OpenWithDialog`、`_extract_with_7z`、`_fetch_latest_release`、`generate_video_thumbnails`、`_capture_video_frames`、未用 import/常量；合并 `_WINDOWS_RESERVED_NAMES` 重复定义。
+
+### 新增回归测试
+
+`test_safety.py` 新增 28 项（合计 104 项）：正则绕过与回退、编码启发式/BOM/截断、zip 无重复条目、folder_structure 归一化、失效根目录错误信号、old/ 守卫、剪贴板优先级语义、帮助编号/README 契约/保留名。
+
+### 本轮验证
+
+- `python -m unittest -q test_safety.py test_tooling.py` → **104 tests OK**
+- `py_compile` 7 个模块 + Python 3.8 grammar AST → OK
+- `git diff --check` → clean
+- 严格 venv（Python 3.13.2 x64，`include-system-site-packages=false`）构建：
+  - `dist/SeavoExplorer.exe`，**96,948,767 bytes / 92.46 MiB**
+  - SHA-256：**F5D487EC3B58987665A3AF577044473B96A0E377EA31A228EA8666BC7F4ECBAE**
+  - manifest：`strict_environment=true`、`path_sanitized=true`、`external_binary_count=0`，全部 8 项检查为 true（含隔离冒烟）
+  - **`source.dirty=true`**：这是提交前工作树的测试构建；v0.6.0 的 clean 发布构建、tag 与远端资产 digest 将在发布完成后补充。
+- v0.6.0 的 commit/push/tag/Release 状态将在发布完成后补充。
+
+### 其他更正
+
+- 原报告"`_transactional_extract_archive` 6 处测试调用"应为 **8 处**（922、941、954、967、974、985、1001、1074）。
+- 原报告"构建/发布链 fail-closed"仍主要来自静态阅读 + tooling 单测；本轮未执行远端发布，结论等级应视为"代码审查 + 单测支持"，不是端到端发布验证。
 
 ---
 
@@ -48,6 +97,8 @@
 ---
 
 ## 2. 缺陷清单
+
+> 以下为 2026-08-31 原结论；F1/F2/F3/F4/F6/F7 的更正与修复状态见上方「审查更正与修复状态（2026-09-09）」。
 
 ### F1（P1）配置载入侧的自定义正则不做安全校验 → 扫描线程挂死
 
@@ -258,6 +309,8 @@ UI 侧处理见 [main.py:5516](/main.py#L5516)、[main.py:5522](/main.py#L5522)�
 ---
 
 ## 5. 文档与代码漂移
+
+> 以下为 0.5.4 分析时的状态；0.6.0 已同步版本号、测试数、正则安全说明与 PDF/帮助文案。
 
 | 位置 | 现状 |
 | --- | --- |

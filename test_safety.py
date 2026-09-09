@@ -1077,6 +1077,392 @@ class ArchiveSafetyTests(unittest.TestCase):
         self.assertEqual(read_text(os.path.join(destination, filename)), '7z content')
         self.assert_no_staging()
 
+class RegexSafetyRegressionTests(unittest.TestCase):
+    def test_rejects_brace_quantifier_bypasses(self):
+        patterns = [
+            r'^S(\d{1,2})+$',
+            r'^S(\d{1,3})+$',
+            r'^S(\d{1,2})*$',
+            r'^S(\d{1,2}){1,}$',
+            r'^S(\d{1,2}){2,}$',
+            r'^S(\d{3,4})+$',
+        ]
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                ok, error = main._validate_project_regex(pattern)
+                self.assertFalse(ok, pattern)
+                self.assertIn('回溯', error)
+
+    def test_rejects_backreference_repeat(self):
+        ok, error = main._validate_project_regex(r'^(a+)\1+$')
+        self.assertFalse(ok)
+        self.assertIn('回溯', error)
+
+    def test_allows_common_safe_patterns(self):
+        patterns = [
+            main.DEFAULT_MB_RE_TEXT,
+            main.DEFAULT_DB_RE_TEXT,
+            r'^S(\d{3,4})(-\d+)?$',
+            r'^S(\d{3,4})(?:-(.*))?$',
+            r'^S(\d{2})+$',
+            r'^S(\d{1,2}){2,10}$',
+            r'^(ab)+$',
+        ]
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                ok, error = main._validate_project_regex(pattern)
+                self.assertTrue(ok, '%s: %s' % (pattern, error))
+
+    def test_resolve_regex_falls_back_for_unsafe_custom(self):
+        pattern, fallback = main._resolve_regex(
+            'custom', r'^S(\d{1,2})+$', main.DEFAULT_MB_RE
+        )
+        self.assertIs(pattern, main.DEFAULT_MB_RE)
+        self.assertTrue(fallback)
+        pattern, fallback = main._resolve_regex(
+            'custom', r'^S(\d{3,4})$', main.DEFAULT_MB_RE
+        )
+        self.assertEqual(pattern.pattern, r'^S(\d{3,4})$')
+        self.assertFalse(fallback)
+
+    def test_optional_backreference_is_not_rejected(self):
+        safe, error = main._is_regex_safe(r'^(a)\1?$')
+        self.assertTrue(safe, error)
+
+    def test_conditional_group_fails_closed(self):
+        ok, error = main._validate_project_regex(r'^(a)?(?(1)b|c)$')
+        self.assertFalse(ok)
+        self.assertIn('回溯', error)
+
+    def test_load_settings_warns_for_unsafe_regex(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = os.path.join(root, 'seavoexplorer.json')
+            with open(cfg, 'w', encoding='utf-8') as stream:
+                json.dump({
+                    'project_paths': [],
+                    'regex_state': 'custom',
+                    'custom_mb_regex': r'^S(\d{1,2})+$',
+                    'custom_db_regex': main.DEFAULT_DB_RE_TEXT,
+                }, stream)
+
+            class Stub(object):
+                pass
+
+            stub = Stub()
+            for name in (
+                '_init_default_settings',
+                'load_settings',
+                '_backup_corrupt_file',
+                '_get_default_quick_access_paths',
+            ):
+                setattr(stub, name, getattr(main.MainWindow, name).__get__(stub))
+            stub.CONFIG_FILE = cfg
+            stub.app_dir = root
+            stub._pending_load_warnings = []
+            stub.load_settings()
+            self.assertTrue(any('自定义项目正则无效' in item for item in stub._pending_load_warnings))
+            _pattern, fallback = main._resolve_regex(
+                stub.regex_state, stub.custom_mb_regex, main.DEFAULT_MB_RE
+            )
+            self.assertTrue(fallback)
+
+
+class TextPreviewEncodingTests(unittest.TestCase):
+    def test_utf8_and_gbk_round_trip(self):
+        text = '项目文件说明'
+        self.assertEqual(main._decode_text_bytes(text.encode('utf-8')), text)
+        self.assertEqual(main._decode_text_bytes(text.encode('gbk')), text)
+
+    def test_utf8_bom_is_stripped(self):
+        text = '中文内容'
+        self.assertEqual(
+            main._decode_text_bytes(b'\xef\xbb\xbf' + text.encode('utf-8')),
+            text,
+        )
+
+    def test_gbk_ambiguous_common_characters_prefer_gbk(self):
+        for text in ('一', '目录', '说明', '版本'):
+            with self.subTest(text=text):
+                self.assertEqual(main._decode_text_bytes(text.encode('gbk')), text)
+
+    def test_utf8_chinese_is_not_misdetected(self):
+        text = '说明文档项目版本'
+        self.assertEqual(main._decode_text_bytes(text.encode('utf-8')), text)
+
+    def test_preview_text_strips_bom_and_reports_truncation(self):
+        class PreviewTab(object):
+            def __init__(self):
+                self.value = None
+
+            def setPlainText(self, value):
+                self.value = value
+
+        class Stub(object):
+            def __init__(self):
+                self.preview_tab = PreviewTab()
+
+            def format_file_size(self, size):
+                return main.MainWindow.format_file_size(self, size)
+
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'bom.txt')
+            with open(path, 'w', encoding='utf-8-sig') as stream:
+                stream.write('中文')
+            stub = Stub()
+            main.MainWindow._preview_text(stub, path)
+            self.assertEqual(stub.preview_tab.value, '中文')
+
+            with mock.patch.object(main.os.path, 'getsize', return_value=2 * 1024 * 1024):
+                main.MainWindow._preview_text(stub, path)
+            self.assertIn('文件过大', stub.preview_tab.value)
+
+
+class ZipCreationTests(unittest.TestCase):
+    def _stub(self):
+        class Stub(object):
+            pass
+
+        stub = Stub()
+        stub._create_unique_zip_path = main.MainWindow._create_unique_zip_path.__get__(stub)
+        stub._write_path_to_zip = main.MainWindow._write_path_to_zip.__get__(stub)
+        return stub
+
+    def test_directory_entries_are_unique(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, 'tree', 'inner'))
+            with open(os.path.join(root, 'tree', 'inner', 'f.txt'), 'w', encoding='utf-8') as stream:
+                stream.write('x')
+            stub = self._stub()
+            zip_path, _name = stub._create_unique_zip_path(root, 'tree')
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+                stub._write_path_to_zip(archive, os.path.join(root, 'tree'), root)
+            names = zipfile.ZipFile(zip_path).namelist()
+            self.assertEqual(names, ['tree/', 'tree/inner/', 'tree/inner/f.txt'])
+            self.assertEqual(len(names), len(set(names)))
+
+    def test_single_file_has_no_directory_entry(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, 'only.txt')
+            with open(source, 'w', encoding='utf-8') as stream:
+                stream.write('x')
+            stub = self._stub()
+            zip_path, _name = stub._create_unique_zip_path(root, 'only')
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+                stub._write_path_to_zip(archive, source, root)
+            self.assertEqual(zipfile.ZipFile(zip_path).namelist(), ['only.txt'])
+
+
+class FolderStructureNormalizationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = main.QApplication.instance() or main.QApplication([])
+
+    def test_partial_dict_is_completed_consistently(self):
+        parent = main.QWidget()
+        parent.folder_structure = {'version': '03', 'selected_folders': {'BOM': True}}
+        dialog = main.NewStructureDialog(project_folder=None, parent=parent)
+        self.assertEqual(set(dialog.selected_folders), set(main.DEFAULT_STRUCTURE_FOLDERS))
+        self.assertTrue(all(
+            dialog.folder_checkboxes[name].isChecked()
+            for name in main.DEFAULT_STRUCTURE_FOLDERS
+        ))
+        self.assertEqual(
+            set(dialog.get_structure_info()['selected_folders']),
+            set(main.DEFAULT_STRUCTURE_FOLDERS),
+        )
+        self.assertIn('SCH', dialog.preview_text.toPlainText())
+
+    def test_list_and_non_dict_fall_back_to_defaults(self):
+        normalized = main._normalize_folder_structure(['BOM'])
+        self.assertEqual(
+            set(normalized['selected_folders']),
+            set(main.DEFAULT_STRUCTURE_FOLDERS),
+        )
+        parent = main.QWidget()
+        parent.folder_structure = ['BOM']
+        dialog = main.NewStructureDialog(project_folder=None, parent=parent)
+        self.assertTrue(all(
+            dialog.folder_checkboxes[name].isChecked()
+            for name in main.DEFAULT_STRUCTURE_FOLDERS
+        ))
+
+    def test_custom_folders_filtered_and_version_normalized(self):
+        normalized = main._normalize_folder_structure({
+            'version': '7',
+            'selected_folders': {'BOM': 'false'},
+            'custom_folders': ['A', '', 1, ' B '],
+        })
+        self.assertEqual(normalized['version'], '07')
+        self.assertFalse(normalized['selected_folders']['BOM'])
+        self.assertEqual(normalized['custom_folders'], ['A', ' B '])
+
+    def test_load_settings_normalizes_folder_structure(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = os.path.join(root, 'seavoexplorer.json')
+            with open(cfg, 'w', encoding='utf-8') as stream:
+                json.dump({'folder_structure': {'selected_folders': ['BOM']}}, stream)
+
+            class Stub(object):
+                pass
+
+            stub = Stub()
+            for name in (
+                '_init_default_settings',
+                'load_settings',
+                '_backup_corrupt_file',
+                '_get_default_quick_access_paths',
+            ):
+                setattr(stub, name, getattr(main.MainWindow, name).__get__(stub))
+            stub.CONFIG_FILE = cfg
+            stub.app_dir = root
+            stub._pending_load_warnings = []
+            stub.load_settings()
+            self.assertIsInstance(stub.folder_structure, dict)
+            self.assertEqual(
+                set(stub.folder_structure['selected_folders']),
+                set(main.DEFAULT_STRUCTURE_FOLDERS),
+            )
+
+
+class FolderThreadErrorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = main.QApplication.instance() or main.QApplication([])
+
+    def test_missing_root_emits_error_for_stats(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = os.path.join(root, 'missing')
+            thread = main.FolderStatsThread(missing, 7)
+            events = []
+            thread.stats_ready.connect(lambda *args: events.append(('ready', args)))
+            thread.stats_error.connect(lambda *args: events.append(('error', args)))
+            thread.run()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0][0], 'error')
+            self.assertEqual(events[0][1][0], 7)
+
+    def test_missing_root_emits_error_for_search(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = os.path.join(root, 'missing')
+            thread = main.FileSearchThread(missing, 8, '', None, None)
+            events = []
+            thread.search_ready.connect(lambda *args: events.append(('ready', args)))
+            thread.search_error.connect(lambda *args: events.append(('error', args)))
+            thread.run()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0][0], 'error')
+            self.assertEqual(events[0][1][0], 8)
+
+
+class OldArchiveGuardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = main.QApplication.instance() or main.QApplication([])
+
+    def _window(self):
+        class Stub(object):
+            def _reset_preview(self):
+                pass
+
+            def statusBar(self):
+                return SimpleNamespace(showMessage=lambda *args: None)
+
+        stub = Stub()
+        stub.archive_to_old_folder = main.MainWindow.archive_to_old_folder.__get__(stub)
+        return stub
+
+    def test_file_inside_old_is_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_dir = os.path.join(root, 'old')
+            os.makedirs(old_dir)
+            path = os.path.join(old_dir, 'a.txt')
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write('x')
+            window = self._window()
+            with mock.patch.object(main.QMessageBox, 'information') as info:
+                with mock.patch.object(main.QMessageBox, 'warning') as warning:
+                    window.archive_to_old_folder([path])
+            self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.isdir(os.path.join(old_dir, 'old')))
+            info.assert_called_once()
+            warning.assert_not_called()
+
+    def test_directory_named_old_is_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_dir = os.path.join(root, 'old')
+            os.makedirs(old_dir)
+            window = self._window()
+            with mock.patch.object(main.QMessageBox, 'information') as info:
+                with mock.patch.object(main.QMessageBox, 'warning') as warning:
+                    window.archive_to_old_folder([old_dir])
+            self.assertTrue(os.path.isdir(old_dir))
+            self.assertFalse(os.path.isdir(os.path.join(old_dir, 'old')))
+            info.assert_called_once()
+            warning.assert_not_called()
+
+    def test_normal_file_is_archived(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'a.txt')
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write('x')
+            window = self._window()
+            with mock.patch.object(main.QMessageBox, 'information') as info:
+                with mock.patch.object(main.QMessageBox, 'warning') as warning:
+                    window.archive_to_old_folder([path])
+            self.assertTrue(os.path.exists(os.path.join(root, 'old', 'a.txt')))
+            self.assertFalse(os.path.exists(path))
+            info.assert_not_called()
+            warning.assert_not_called()
+
+
+class ClipboardPrecedenceTests(unittest.TestCase):
+    def test_non_local_url_ignores_stale_internal_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = os.path.join(root, 'internal.txt')
+            with open(internal, 'w', encoding='utf-8') as stream:
+                stream.write('x')
+            mime_data = SimpleNamespace(
+                hasUrls=lambda: True,
+                urls=lambda: [main.QUrl('https://example.invalid/page')],
+            )
+            clipboard = SimpleNamespace(mimeData=lambda: mime_data)
+            window = SimpleNamespace(clipboard_paths=[internal], clipboard_path=internal)
+            with mock.patch.object(main.QApplication, 'clipboard', return_value=clipboard):
+                sources = main.MainWindow._get_clipboard_source_paths(window)
+            self.assertEqual(sources, [])
+
+
+class DocumentationConsistencyTests(unittest.TestCase):
+    def test_help_headings_are_sequential_and_unique(self):
+        source = read_text(os.path.abspath(main.__file__))
+        headings = re.findall(r'<h3[^>]*>([^<]+)</h3>', source)
+        section_headings = [heading for heading in headings if '、' in heading]
+        prefixes = [heading.split('、', 1)[0] for heading in section_headings]
+        self.assertEqual(
+            prefixes,
+            ['一', '二', '三', '四', '五', '六', '七', '八',
+             '九', '十', '十一', '十二', '十三', '十四'],
+        )
+
+    def test_readme_regex_contract_matches_one_group_support(self):
+        project_root = os.path.dirname(os.path.abspath(main.__file__))
+        readme = read_text(os.path.join(project_root, 'README.md'))
+        self.assertIn('至少提供 1 个捕获组', readme)
+        ok, error = main._validate_project_regex(r'^S(\d{3,4})$')
+        self.assertTrue(ok, error)
+
+    def test_pdf_help_does_not_claim_pagination(self):
+        source = read_text(os.path.abspath(main.__file__))
+        self.assertIn('预览前 3 页文本', source)
+        self.assertNotIn('多页预览，可翻页查看', source)
+
+    def test_reserved_names_include_com_lpt_and_exclude_clock(self):
+        self.assertIn('COM1', main._WINDOWS_RESERVED_NAMES)
+        self.assertIn('LPT9', main._WINDOWS_RESERVED_NAMES)
+        self.assertNotIn('CLOCK$', main._WINDOWS_RESERVED_NAMES)
+        self.assertIsNone(main._validate_windows_filename('CLOCK$'))
+        self.assertIsNotNone(main._validate_windows_filename('CON'))
+
 
 if __name__ == '__main__':
     unittest.main()

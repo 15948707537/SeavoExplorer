@@ -1,6 +1,6 @@
 # SeavoExplorer Windows 构建与发布指南
 
-本文以本机已经跑通的 v0.5.0/v0.5.1 构建与发布事实为基础，并记录仓库当前固化的后续流程。`main.spec` 是 onefile/onedir 的唯一 PyInstaller 配置来源；draft、三资产 digest 核验与 publish 已随 v0.5.1 完成首次真实 GitHub 端到端发布。`--resume` 恢复前检仍由无网络单元测试覆盖，只有真实中断时才执行。
+本文以本机已经跑通的 v0.5.0/v0.5.1/v0.6.0 构建与发布事实为基础，并记录仓库当前固化的后续流程。`main.spec` 是 onefile/onedir 的唯一 PyInstaller 配置来源；draft、三资产 digest 核验与 publish 已随 v0.5.1 完成首次真实 GitHub 端到端发布。`--resume` 恢复前检仍由无网络单元测试覆盖，只有真实中断时才执行。
 
 ## 1. 已验证基线
 
@@ -138,7 +138,7 @@ git rev-list --left-right --count origin/main...HEAD
 
 需要 GitHub CLI 2.94.0 或更高版本，并先执行 `gh auth login`。发布脚本必须用上述严格构建 venv 的 Python 运行。
 
-已发布版本不可重复发布；当前发布使用 `v0.5.4`：
+已发布版本不可重复发布；当前发布使用 `v0.6.0`：
 
 ```powershell
 .\.venv-build\Scripts\python.exe release.py vX.Y.Z

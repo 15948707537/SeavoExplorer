@@ -1,5 +1,6 @@
 import sys
 import os
+import codecs
 import re
 import json
 import time
@@ -20,8 +21,8 @@ from collections import namedtuple
 # 尝试导入OpenCV用于视频缩略图生成
 try:
     import cv2
-    import numpy as np
-    from PIL import Image
+    import numpy as np  # OpenCV 依赖探测
+    from PIL import Image  # 可选图像库探测
     HAS_OPENCV = True
 except ImportError:
     HAS_OPENCV = False
@@ -34,7 +35,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeView, QTextEdit,
                                 QDialog, QGridLayout, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QFormLayout,
                                 QRadioButton, QButtonGroup, QInputDialog, QSplashScreen,
-                                QToolBar, QToolButton, QSizePolicy, QProgressDialog,
+                                QToolButton, QProgressDialog,
                                 QCheckBox, QComboBox, QListWidget, QListWidgetItem,
                                 QAction)
 from PyQt5.QtCore import QDir, Qt, QModelIndex, QThread, pyqtSignal, QRect, QUrl, QMimeData, QTimer, QEvent
@@ -50,8 +51,15 @@ DEFAULT_MB_RE = re.compile(DEFAULT_MB_RE_TEXT)
 DEFAULT_DB_RE = re.compile(DEFAULT_DB_RE_TEXT)
 
 def _resolve_regex(state, custom_text, default_re):
-    """根据 state 返回 (re.Pattern, is_fallback)。state 为 custom 时尝试编译 custom_text，失败/为空/类型非法时兜底到默认正则。"""
+    """根据 state 返回 (re.Pattern, is_fallback)。
+
+    自定义正则必须先通过保存期同一套契约与 ReDoS 校验；失败/为空/类型非法时
+    显式回退到默认正则，避免被污染的 sidecar 配置绕过设置对话框的校验。
+    """
     if state == "custom" and isinstance(custom_text, str) and custom_text:
+        ok, _error = _validate_project_regex(custom_text)
+        if not ok:
+            return default_re, True
         try:
             return re.compile(custom_text), False
         except re.error:
@@ -134,7 +142,11 @@ def _version_rank_from_suffix(suffix):
         return 27 + (ord(suffix[0]) - ord('a')) * 26 + (ord(suffix[1]) - ord('a'))
     return None
 
-_WINDOWS_RESERVED_NAMES = frozenset(['CON', 'PRN', 'AUX', 'NUL', 'CLOCK$'])
+_WINDOWS_RESERVED_NAMES = {
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)),
+    *(f'LPT{i}' for i in range(1, 10)),
+}
 
 def _validate_windows_filename(name):
     """校验 Windows 文件名合法性。返回错误提示；合法返回 None。
@@ -150,7 +162,7 @@ def _validate_windows_filename(name):
     if name.endswith(('.', ' ')):
         return '名称不能以点或空格结尾'
     stem = name.split('.')[0].strip().upper()
-    if stem in _WINDOWS_RESERVED_NAMES or re.fullmatch(r'(?:COM|LPT)[1-9]', stem):
+    if stem in _WINDOWS_RESERVED_NAMES:
         return f'"{stem}" 是 Windows 保留名称，请更换名称'
     return None
 
@@ -164,34 +176,248 @@ def _coerce_bool(value, default=False):
         return value.strip().lower() in ('1', 'true', 'yes', 'on')
     return default
 
-def _is_regex_safe(pattern):
-    """检测正则是否有 ReDoS（灾难性回溯）风险（启发式）。
+_REGEX_MAX_SAFE_BOUNDED_REPEAT = 16
+_REGEX_BRACE_QUANTIFIER_RE = re.compile(r'\{(\d+)(?:,(\d*))?\}')
 
-    仅做结构检查，绝不实际执行可疑模式的搜索：
-    CPython 的 re 回溯在 C 层持有 GIL，任何"实测超时"方案都会卡死本进程；
-    子进程方案在 PyInstaller 打包环境不可用。启发式拦截常见灾难性回溯结构：
-    1. 嵌套量词：(a+)+、(a*)* 等（外层仅 ? 的可选组为 0/1 次，无组合爆炸风险，不拦截）；
-    2. 点星组重复：(a.*)+ 等；
-    3. 嵌套分支：(a|aa)+、(a|b)* 等。
-    复杂变体可能漏检，属尽力而为的防护（与 AGENTS.md 记录一致）。
+
+class _RegexStructureNode(object):
+    """正则结构树节点（仅供 ReDoS 启发式分析，不执行匹配）。"""
+
+    __slots__ = ('kind', 'quantifier', 'children', 'has_alternation')
+
+    def __init__(self, kind, quantifier=None, children=None, has_alternation=False):
+        self.kind = kind
+        self.quantifier = quantifier
+        self.children = children or []
+        self.has_alternation = has_alternation
+
+
+def _regex_quantifier_at(pattern, index):
+    """解析 index 处的量词，返回 (结束位置, 最小次数, 最大次数)；无则 None。
+
+    最大次数为 None 表示无上限。结尾的懒惰/占有标记（? 或 +）一并消费。
+    """
+    if index >= len(pattern):
+        return None
+    char = pattern[index]
+    if char in '*+?':
+        end = index + 1
+        if end < len(pattern) and pattern[end] in '?+':
+            end += 1
+        if char == '*':
+            return end, 0, None
+        if char == '+':
+            return end, 1, None
+        return end, 0, 1
+    if char == '{':
+        match = _REGEX_BRACE_QUANTIFIER_RE.match(pattern, index)
+        if not match:
+            return None
+        minimum = int(match.group(1))
+        if match.group(2) is None:
+            maximum = minimum
+        elif match.group(2) == '':
+            maximum = None
+        else:
+            maximum = int(match.group(2))
+        end = match.end()
+        if end < len(pattern) and pattern[end] in '?+':
+            end += 1
+        return end, minimum, maximum
+    return None
+
+
+def _regex_quantifier_is_variable(quantifier):
+    if quantifier is None:
+        return False
+    minimum, maximum = quantifier
+    return maximum is None or maximum > minimum
+
+
+def _regex_quantifier_is_repeated(quantifier):
+    """是否为可能产生组合爆炸的外层重复。
+
+    有界重复 {m,n} 且 n 较小时最多只有 n-m 层选择，不足以造成灾难性回溯；
+    只对无上限或上限很大的重复做嵌套结构检查，避免误拒常见合法规则。
+    """
+    if quantifier is None:
+        return False
+    _minimum, maximum = quantifier
+    if maximum is None:
+        return True
+    return maximum > 1 and maximum > _REGEX_MAX_SAFE_BOUNDED_REPEAT
+
+
+def _regex_parse_quantifier(pattern, index):
+    parsed = _regex_quantifier_at(pattern, index)
+    if parsed is None:
+        return None, index
+    end, minimum, maximum = parsed
+    return (minimum, maximum), end
+
+
+def _regex_parse_sequence(pattern, index, stop_at_paren=False):
+    nodes = []
+    has_alternation = False
+    while index < len(pattern):
+        char = pattern[index]
+        if char == ')' and stop_at_paren:
+            return nodes, has_alternation, index
+        if char == '|':
+            has_alternation = True
+            index += 1
+            continue
+        node, index = _regex_parse_atom(pattern, index)
+        if node is not None:
+            nodes.append(node)
+    return nodes, has_alternation, index
+
+
+def _regex_parse_atom(pattern, index):
+    char = pattern[index]
+    if char == '\\':
+        if index + 1 >= len(pattern):
+            return _RegexStructureNode('atom'), index + 1
+        if pattern[index + 1] in '123456789':
+            kind = 'backref'
+            end = index + 2
+            while end < len(pattern) and pattern[end].isdigit():
+                end += 1
+        else:
+            kind = 'atom'
+            end = index + 2
+        quantifier, end = _regex_parse_quantifier(pattern, end)
+        return _RegexStructureNode(kind, quantifier), end
+    if char == '[':
+        end = index + 1
+        if end < len(pattern) and pattern[end] == '^':
+            end += 1
+        if end < len(pattern) and pattern[end] == ']':
+            end += 1
+        while end < len(pattern):
+            if pattern[end] == '\\' and end + 1 < len(pattern):
+                end += 2
+                continue
+            if pattern[end] == ']':
+                end += 1
+                break
+            end += 1
+        quantifier, end = _regex_parse_quantifier(pattern, end)
+        return _RegexStructureNode('atom', quantifier), end
+    if char == '(':
+        return _regex_parse_group(pattern, index)
+    if char in '*+?{':
+        quantifier, end = _regex_parse_quantifier(pattern, index)
+        if quantifier is not None:
+            return _RegexStructureNode('atom'), end
+        return _RegexStructureNode('atom'), index + 1
+    quantifier, end = _regex_parse_quantifier(pattern, index + 1)
+    return _RegexStructureNode('atom', quantifier), end
+
+
+def _regex_parse_group(pattern, index):
+    if pattern.startswith('(?#', index):
+        end = pattern.find(')', index + 3)
+        return None, (len(pattern) if end == -1 else end + 1)
+    if pattern.startswith('(?P=', index):
+        end = pattern.find(')', index + 4)
+        if end == -1:
+            return _RegexStructureNode('backref'), len(pattern)
+        quantifier, end = _regex_parse_quantifier(pattern, end + 1)
+        return _RegexStructureNode('backref', quantifier), end
+    if pattern.startswith('(?(', index):
+        raise ValueError('conditional group is not supported by the safety analyzer')
+    body_start = index + 1
+    if (
+        pattern.startswith('(?:', index)
+        or pattern.startswith('(?=', index)
+        or pattern.startswith('(?!', index)
+        or pattern.startswith('(?>', index)
+    ):
+        body_start = index + 3
+    elif pattern.startswith('(?<=', index) or pattern.startswith('(?<!', index):
+        body_start = index + 4
+    elif pattern.startswith('(?P<', index):
+        name_end = pattern.find('>', index + 4)
+        if name_end != -1:
+            body_start = name_end + 1
+    elif pattern.startswith('(?', index):
+        colon = pattern.find(':', index + 2)
+        close = pattern.find(')', index + 2)
+        if colon != -1 and (close == -1 or colon < close):
+            body_start = colon + 1
+        elif close != -1:
+            quantifier, end = _regex_parse_quantifier(pattern, close + 1)
+            return _RegexStructureNode('atom', quantifier), end
+    children, has_alternation, end = _regex_parse_sequence(
+        pattern, body_start, stop_at_paren=True
+    )
+    if end >= len(pattern) or pattern[end] != ')':
+        return _RegexStructureNode('group', None, children, has_alternation), len(pattern)
+    quantifier, end = _regex_parse_quantifier(pattern, end + 1)
+    return _RegexStructureNode('group', quantifier, children, has_alternation), end
+
+
+def _regex_node_is_variable(node):
+    """节点是否可能匹配不同长度的文本（保守判断）。"""
+    if node.kind == 'backref':
+        return True
+    if _regex_quantifier_is_variable(node.quantifier):
+        return True
+    if node.kind == 'group':
+        if node.has_alternation:
+            return True
+        return any(_regex_node_is_variable(child) for child in node.children)
+    return False
+
+
+def _regex_node_has_repeated_group(node):
+    if node.kind == 'group':
+        if _regex_quantifier_is_repeated(node.quantifier):
+            return True
+        return any(_regex_node_has_repeated_group(child) for child in node.children)
+    return False
+
+
+def _regex_node_is_unsafe(node):
+    if node.kind == 'group' and _regex_quantifier_is_repeated(node.quantifier):
+        if node.has_alternation:
+            return True
+        if any(_regex_node_is_variable(child) for child in node.children):
+            return True
+        if any(_regex_node_has_repeated_group(child) for child in node.children):
+            return True
+    if node.kind == 'backref' and _regex_quantifier_is_repeated(node.quantifier):
+        return True
+    if node.kind == 'group':
+        return any(_regex_node_is_unsafe(child) for child in node.children)
+    return False
+
+
+def _is_regex_safe(pattern):
+    r"""检测正则是否有 ReDoS（灾难性回溯）风险（结构启发式）。
+
+    在旧版 +/* 文本检查基础上，增加了对 {m,n} 量词、嵌套重复组和回溯引用的
+    结构分析；重点拦截“外层重复组内部还能变长匹配”的组合，例如
+    ^S(\d{1,2})+$、^S(\d{1,3})*$、^(a+)+$、^(a|aa)+$、^(a+)\1+$。
+
+    Python 的 re 在 C 层持有 GIL，灾难性回溯无法被 requestInterruption()
+    中断；本函数只做结构分析，绝不执行可疑模式的搜索。复杂/无法解析的结构
+    按 fail-closed 处理，返回不安全；外层仅 ? 或 {0,1} 的可选组不视为重复。
     """
     try:
         re.compile(pattern)
     except re.error as e:
         return False, str(e)
-    # 嵌套量词：括号内 +/* 作用于具体字符（排除 . 通配与量词自身，避免误拒 (.*)? 类安全结构），
-    # 且 ) 后带重复量词 +/*（? 为 0/1 次可选，无组合爆炸风险，不拦截）
-    if re.search(r'\([^()]*[^.+*][+*][^()]*\)[+*]', pattern):
-        return False, 'nested quantifier'
-    # 点星组重复：组内含 .*（或 .+）且组外带 +/* —— (a.*)+ 类高危；外层仅 ? 的 (.*)? 属安全可选组
-    if re.search(r'\([^()]*\.[*+][^()]*\)[+*]', pattern):
-        return False, 'dot-star group repeat'
-    # 嵌套分支：括号内含 | 且 ) 后带重复量词 +/*
-    if re.search(r'\([^()]*\|[^()]*\)[+*]', pattern):
-        return False, 'nested alternation'
-    return True, ''
+    try:
+        nodes, _has_alternation, _end = _regex_parse_sequence(pattern, 0, False)
+        if any(_regex_node_is_unsafe(node) for node in nodes):
+            return False, 'repeated group with variable-length body'
+        return True, ''
+    except Exception:
+        return False, 'regex structure is too complex to analyze safely'
 
-APP_VERSION = '0.5.4'
+APP_VERSION = '0.6.0'
 GITHUB_REPO_URL = 'https://github.com/FengBujue0104/SeavoExplorer/'
 GITHUB_RELEASES_URL = 'https://github.com/FengBujue0104/SeavoExplorer/releases'
 GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/FengBujue0104/SeavoExplorer/releases/latest'
@@ -307,11 +533,94 @@ def _decode_zip_name(raw):
     return raw
 
 
+_TEXT_MOJIBAKE_MIN_RATIO = 0.5
+
+
+def _is_cjk_char(char):
+    code = ord(char)
+    return (
+        0x3400 <= code <= 0x4DBF
+        or 0x4E00 <= code <= 0x9FFF
+        or 0xF900 <= code <= 0xFAFF
+    )
+
+
+def _text_has_cjk(text):
+    return any(_is_cjk_char(char) for char in text)
+
+
+def _text_looks_like_gbk_mojibake(text):
+    """UTF-8 解码结果是否像“GBK 字节被当成 UTF-8”产生的乱码。"""
+    visible = [char for char in text if not char.isspace()]
+    if not visible:
+        return False
+    suspicious = sum(1 for char in visible if 0x80 <= ord(char) <= 0x07FF)
+    return suspicious >= 1 and suspicious >= len(visible) * _TEXT_MOJIBAKE_MIN_RATIO
+
+
+def _decode_text_bytes(raw):
+    """按 BOM + UTF-8/GBK 启发式解码文本预览字节。
+
+    没有一种固定顺序对所有文件都正确：UTF-8 字节可能恰好是合法 GBK，
+    GBK 字节也可能恰好是合法 UTF-8。这里先用 BOM，再优先 UTF-8；只有当
+    UTF-8 结果明显像 GBK 乱码、且 GBK 结果含中文时才回退 GBK。
+    """
+    if raw.startswith(codecs.BOM_UTF32_LE) or raw.startswith(codecs.BOM_UTF32_BE):
+        return raw.decode('utf-32')
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw.decode('utf-8-sig')
+    if raw.startswith(codecs.BOM_UTF16_LE) or raw.startswith(codecs.BOM_UTF16_BE):
+        return raw.decode('utf-16')
+    try:
+        utf8_text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        utf8_text = None
+    if utf8_text is not None:
+        if not _text_has_cjk(utf8_text) and _text_looks_like_gbk_mojibake(utf8_text):
+            try:
+                gbk_text = raw.decode('gbk')
+            except UnicodeDecodeError:
+                return utf8_text
+            if _text_has_cjk(gbk_text):
+                return gbk_text
+        return utf8_text
+    try:
+        return raw.decode('gbk')
+    except UnicodeDecodeError:
+        return raw.decode('utf-8', errors='replace')
+
+
 # Windows 文件属性
 FILE_ATTRIBUTE_HIDDEN = 0x02
 
 # 项目版本文件夹默认子目录模板（集中定义，避免对话框与默认设置各写一份）
 DEFAULT_STRUCTURE_FOLDERS = ['BOM', 'SCH', '物料', '评审', '信号测试']
+
+
+def _normalize_folder_structure(value):
+    """把持久化的文件夹结构归一化为完整、可安全消费的 dict。"""
+    result = {
+        'version': '00',
+        'selected_folders': {name: True for name in DEFAULT_STRUCTURE_FOLDERS},
+        'custom_folders': [],
+    }
+    if not isinstance(value, dict):
+        return result
+    version = value.get('version')
+    if isinstance(version, (str, int)) and re.fullmatch(r'\d{1,2}', str(version)):
+        result['version'] = str(version).zfill(2)
+    selected = value.get('selected_folders')
+    if isinstance(selected, dict):
+        result['selected_folders'] = {
+            name: _coerce_bool(selected.get(name, True), True)
+            for name in DEFAULT_STRUCTURE_FOLDERS
+        }
+    custom = value.get('custom_folders')
+    if isinstance(custom, list):
+        result['custom_folders'] = [
+            item for item in custom if isinstance(item, str) and item.strip()
+        ]
+    return result
 
 # 各类文件预览的截断阈值（产品行为参数，集中可调）
 PREVIEW_PDF_PAGES = 3
@@ -358,12 +667,6 @@ ARCHIVE_RATIO_CHECK_MIN_SIZE = 100 * 1024 * 1024
 ARCHIVE_DISK_SAFETY_MIN = 512 * 1024 * 1024
 ARCHIVE_COPY_CHUNK_SIZE = 1024 * 1024
 FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-
-_WINDOWS_RESERVED_NAMES = {
-    'CON', 'PRN', 'AUX', 'NUL',
-    *(f'COM{i}' for i in range(1, 10)),
-    *(f'LPT{i}' for i in range(1, 10)),
-}
 
 
 class ArchiveSafetyError(Exception):
@@ -1177,40 +1480,6 @@ class ZoomableImageLabel(QLabel):
         return f'{int(self._zoom * 100)}%'
 
 
-class OpenWithDialog(QDialog):
-    def __init__(self, file_path, parent=None):
-        super().__init__(parent)
-        self.file_path = file_path
-        self.result = None
-        self.setWindowTitle('打开方式')
-        self.setGeometry(300, 300, 400, 150)
-        
-        layout = QVBoxLayout()
-        label = QLabel(f'选择打开文件的方式：\n\n{os.path.basename(self.file_path)}')
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        
-        button_layout = QHBoxLayout()
-        direct_open_btn = QPushButton('直接打开')
-        direct_open_btn.clicked.connect(self.direct_open)
-        explorer_btn = QPushButton('在资源管理器中打开')
-        explorer_btn.clicked.connect(self.explorer_open)
-        cancel_btn = QPushButton('取消')
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(direct_open_btn)
-        button_layout.addWidget(explorer_btn)
-        button_layout.addWidget(cancel_btn)
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-        
-    def direct_open(self):
-        self.result = 'direct'
-        self.accept()
-        
-    def explorer_open(self):
-        self.result = 'explorer'
-        self.accept()
-
 class CommentEditDialog(QDialog):
     """注释编辑对话框"""
     def __init__(self, title, current_comment, parent=None):
@@ -1696,11 +1965,7 @@ class CheckUpdateThread(QThread):
 class FolderScanThread(QThread):
     """文件夹扫描线程，用于异步加载项目文件夹"""
     scan_completed = pyqtSignal(list, list)  # 发射(主板文件夹列表, 子卡文件夹列表)
-    scan_started = pyqtSignal()
     scan_progress = pyqtSignal(str)  # 发射当前扫描的目录
-    
-    MAX_FILES = 50000
-    MAX_MATCHES_WARNING = 500
 
     def __init__(self, settings, include_subfolders, comments, sort_by_number=False, mb_regex=None, db_regex=None):
         super().__init__()
@@ -1795,6 +2060,10 @@ class FolderStatsThread(QThread):
         count = 0
         total = 0
         truncated = False
+        if not os.path.isdir(self.root):
+            if not self.isInterruptionRequested():
+                self.stats_error.emit(self.token, f'目录不存在或不可访问: {self.root}')
+            return
         try:
             for dirpath, dirnames, filenames in os.walk(self.root):
                 if self.isInterruptionRequested():
@@ -1838,6 +2107,10 @@ class FileSearchThread(QThread):
     def run(self):
         results = []
         truncated = False
+        if not os.path.isdir(self.root):
+            if not self.isInterruptionRequested():
+                self.search_error.emit(self.token, f'目录不存在或不可访问: {self.root}')
+            return
         try:
             for dirpath, dirnames, filenames in os.walk(self.root):
                 if self.isInterruptionRequested():
@@ -2047,16 +2320,12 @@ class NewStructureDialog(QDialog):
         self.project_folder = project_folder
         self.parent_window = parent
         
-        # 加载保存的文件夹结构设置
+        # 加载保存的文件夹结构设置；异常/旧格式统一归一化，避免勾选态与预览不一致
         if parent and hasattr(parent, 'folder_structure'):
-            saved_structure = parent.folder_structure
-            if 'version' in saved_structure:
-                self.version = saved_structure['version']
-            if 'selected_folders' in saved_structure:
-                self.selected_folders = saved_structure['selected_folders']
-            if 'custom_folders' in saved_structure:
-                # 过滤掉空字符串
-                self.saved_custom_folders = [f for f in saved_structure['custom_folders'] if f.strip()]
+            saved_structure = _normalize_folder_structure(parent.folder_structure)
+            self.version = saved_structure['version']
+            self.selected_folders = saved_structure['selected_folders']
+            self.saved_custom_folders = saved_structure['custom_folders']
         
         # 设置窗口标题
         title = '新建文件夹内部结构'
@@ -3331,7 +3600,7 @@ class MainWindow(QMainWindow):
             if 'default_new_project_folder' in config_data:
                 self.default_new_project_folder = _normalize_persisted_path(config_data['default_new_project_folder'])
             if 'folder_structure' in config_data:
-                self.folder_structure = config_data['folder_structure']
+                self.folder_structure = _normalize_folder_structure(config_data['folder_structure'])
             if 'archive_tool_path' in config_data:
                 self.archive_tool_path = _normalize_persisted_path(config_data['archive_tool_path'])
             enable_7zip = config_data.get('enable_7zip', False)
@@ -3351,6 +3620,22 @@ class MainWindow(QMainWindow):
             self.custom_mb_regex = custom_mb if isinstance(custom_mb, str) else ''
             custom_db = config_data.get('custom_db_regex')
             self.custom_db_regex = custom_db if isinstance(custom_db, str) else ''
+            if self.regex_state == 'custom':
+                invalid_regexes = []
+                for label, custom_regex in (
+                    ('主板', self.custom_mb_regex),
+                    ('子卡', self.custom_db_regex),
+                ):
+                    if not custom_regex:
+                        continue
+                    regex_ok, regex_error = _validate_project_regex(custom_regex)
+                    if not regex_ok:
+                        invalid_regexes.append(f'{label}：{regex_error}')
+                if invalid_regexes:
+                    self._pending_load_warnings.append(
+                        '自定义项目正则无效，已回退默认规则（'
+                        + '；'.join(invalid_regexes) + '）'
+                    )
             for key, _name in PREVIEW_CATEGORIES:
                 cfg_key = f'preview_{key}_enabled'
                 if cfg_key in config_data:
@@ -3861,17 +4146,13 @@ class MainWindow(QMainWindow):
         folder_arcname = os.path.relpath(source_path, base_dir).replace('\\', '/') + '/'
         zf.writestr(folder_arcname, '')
         for root, dirs, files in os.walk(source_path):
-            rel_root = os.path.relpath(root, base_dir)
-            if rel_root != '.':
-                dir_arcname = rel_root.replace('\\', '/') + '/'
-                zf.writestr(dir_arcname, '')
             for dir_name in dirs:
                 dir_path = os.path.join(root, dir_name)
                 dir_arcname = os.path.relpath(dir_path, base_dir).replace('\\', '/') + '/'
                 zf.writestr(dir_arcname, '')
             for file_name in files:
                 file_path = os.path.join(root, file_name)
-                arcname = os.path.relpath(file_path, base_dir)
+                arcname = os.path.relpath(file_path, base_dir).replace('\\', '/')
                 zf.write(file_path, arcname)
 
     def _move_paths_to_recycle(self, file_paths):
@@ -4080,6 +4361,8 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     pass
             try:
+                # DirectConnection 让僵尸列表在 worker 结束时立即移除（即使主线程事件循环
+                # 正被阻塞）；list.remove 受 GIL 保护，deleteLater 是线程安全的延迟销毁。
                 thread.finished.connect(_cleanup, Qt.DirectConnection)
             except RuntimeError:
                 pass
@@ -4632,7 +4915,6 @@ class MainWindow(QMainWindow):
     # ---- 文件搜索（文件名 + 类型 + 日期）----
 
     # 类型下拉：显示名 -> 扩展名集合（None 表示不限）
-    _SEARCH_TYPE_EXTS = None  # 占位，运行时如下表
     _TYPE_OPTIONS = None
 
     def _init_search_type_options(self):
@@ -5053,6 +5335,8 @@ class MainWindow(QMainWindow):
             mime_data = None
 
         if mime_data is not None and mime_data.hasUrls():
+            # 系统剪贴板一旦带 URL（含浏览器复制的非本地链接），说明用户已替换剪贴板；
+            # 此时优先使用系统内容，不能回退到可能过期的程序内缓存。
             paths = []
             seen = set()
             for url in mime_data.urls():
@@ -5372,17 +5656,6 @@ class MainWindow(QMainWindow):
         
         return None
     
-    def _extract_with_7z(self, archive_path, extract_dir):
-        """兼容接口：仅允许解压到空目录，且不覆盖任何已存在条目。"""
-        sevenzip = self._find_7z_tool()
-        if not sevenzip:
-            raise ArchiveSafetyError('未找到7-Zip，请在设置中指定7z.exe路径或安装7-Zip')
-        os.makedirs(extract_dir, exist_ok=True)
-        if os.listdir(extract_dir):
-            raise ArchiveSafetyError('安全解压要求目标临时目录为空')
-        _extract_7z_to_stage(sevenzip, archive_path, extract_dir)
-        return True
-    
     def _list_archive_with_7z(self, archive_path):
         """使用 UTF-8 7-Zip 输出列出压缩包内容，供只读预览使用。"""
         if not getattr(self, 'enable_7zip', False):
@@ -5532,10 +5805,16 @@ class MainWindow(QMainWindow):
                 return
             self._reset_preview()
             moved = 0
+            skipped = []
             for file_path in file_paths:
                 if not os.path.exists(file_path):
                     continue
                 parent_dir = os.path.dirname(file_path)
+                parent_name = os.path.basename(os.path.normpath(parent_dir)).casefold()
+                item_name = os.path.basename(os.path.normpath(file_path)).casefold()
+                if parent_name == 'old' or (os.path.isdir(file_path) and item_name == 'old'):
+                    skipped.append(file_path)
+                    continue
                 target_dir = os.path.join(parent_dir, 'old')
                 os.makedirs(target_dir, exist_ok=True)
                 dest = os.path.join(target_dir, os.path.basename(file_path))
@@ -5550,7 +5829,14 @@ class MainWindow(QMainWindow):
                     dest = os.path.join(target_dir, f'{base}_{i}{ext}')
                 shutil.move(file_path, dest)
                 moved += 1
-            self.statusBar().showMessage(f'已归档 {moved} 个项目到 old/')
+            if moved:
+                self.statusBar().showMessage(f'已归档 {moved} 个项目到 old/')
+            if skipped:
+                QMessageBox.information(
+                    self,
+                    '提示',
+                    f'{len(skipped)} 个项目已在 old/ 目录中，已跳过。',
+                )
         except Exception as e:
             QMessageBox.warning(self, '错误', f'归档失败: {str(e)}')
 
@@ -5768,21 +6054,12 @@ class MainWindow(QMainWindow):
         PREVIEW_TEXT_LIMIT = 1 * 1024 * 1024  # 1 MB
         file_size = os.path.getsize(file_path)
         truncated = file_size > PREVIEW_TEXT_LIMIT
-
-        # 尝试顺序：GBK(中文 Windows 最常见) → UTF-8 → 兜底 UTF-8 + replace
-        content = None
-        for encoding in ('gbk', 'utf-8'):
-            try:
-                with open(file_path, 'r', encoding=encoding) as f:
-                    content = f.read(PREVIEW_TEXT_LIMIT) if truncated else f.read()
-                break
-            except UnicodeDecodeError:
-                continue
-        if content is None:
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read(PREVIEW_TEXT_LIMIT) if truncated else f.read()
-
+        read_limit = PREVIEW_TEXT_LIMIT + 4 if truncated else file_size
+        with open(file_path, 'rb') as stream:
+            raw = stream.read(read_limit)
+        content = _decode_text_bytes(raw)
         if truncated:
+            content = content[:PREVIEW_TEXT_LIMIT]
             content += f'\n\n--- 文件过大,仅显示前 {self.format_file_size(PREVIEW_TEXT_LIMIT)} (共 {self.format_file_size(file_size)}) ---\n'
         self.preview_tab.setPlainText(content)
 
@@ -6276,17 +6553,6 @@ class MainWindow(QMainWindow):
             return self.app_dir
         return os.path.expanduser('~')
 
-    def _fetch_latest_release(self):
-        request = urllib.request.Request(
-            GITHUB_LATEST_RELEASE_API,
-            headers={
-                'Accept': 'application/vnd.github+json',
-                'User-Agent': f'SeavoExplorer/{APP_VERSION}',
-            },
-        )
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode('utf-8'))
-
     def _pick_release_exe_asset(self, release_data):
         assets = release_data.get('assets') or []
         exe_assets = [asset for asset in assets if str(asset.get('name', '')).lower().endswith('.exe')]
@@ -6570,10 +6836,9 @@ class MainWindow(QMainWindow):
         about_text = (
             '<h3>SeavoExplorer - 主板项目文件浏览器</h3>'
             f'<p>版本 {APP_VERSION}</p>'
-            '<p>本版本重点修复稳定性与数据安全问题：扫描大目录/网络盘或下载中关闭窗口不再崩溃；'
-            '保存版本不再静默覆盖（a-z 用完后自动续接 aa-zz）；配置损坏自动备份并提示；'
-            '自定义正则增加契约与灾难性回溯（ReDoS）校验；下载支持断点续传与 SHA-256 完整性校验；'
-            '并改进视频预览、重命名校验、窗口恢复、检查更新等使用体验。</p>'
+            '<p>本版本重点修复自定义项目正则的 ReDoS 风险（新增结构分析，保存与载入双向校验），'
+            '并改进文本预览编码/BOM、zip 打包、文件夹结构配置、失效根目录提示和 old/ 归档；'
+            '同时清理死代码与文档，提升稳定性与可维护性。</p>'
             f'<p>GitHub：<a href="{GITHUB_REPO_URL}">{GITHUB_REPO_URL}</a></p>'
         )
         # 关于页 logo 优先用高清 PNG 源（清晰放大），回退到多尺寸 ico
@@ -6694,12 +6959,12 @@ class MainWindow(QMainWindow):
 <li>粘贴遇到重名文件或文件夹时，会自动追加副本序号，避免覆盖原文件</li>
 </ul>
 
-<h3 style="color: #2980b9;">四、文件预览</h3>
+<h3 style="color: #2980b9;">五、文件预览</h3>
 <p>单击文件树中的文件，下方预览区会自动显示内容：</p>
 <table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">
 <tr style="background: #ecf0f1;"><th>文件类型</th><th>支持格式</th><th>说明</th></tr>
 <tr><td>文本文件</td><td>.txt .csv .log .bom .drc .rep .rpt .md .json .xml .html .htm .ini .cfg</td><td>直接显示文本（UTF-8/GBK 自动识别）</td></tr>
-<tr><td>PDF 文件</td><td>.pdf</td><td>多页预览，可翻页查看</td></tr>
+<tr><td>PDF 文件</td><td>.pdf</td><td>预览前 3 页文本</td></tr>
 <tr><td>Excel 文件</td><td>.xlsx .xlsm .xls</td><td>表格形式预览</td></tr>
 <tr><td>Word 文件</td><td>.docx .doc</td><td>文档内容预览</td></tr>
 <tr><td>图片文件</td><td>.jpg .jpeg .png .bmp .gif .tiff .tif .webp .svg</td><td>缩略图预览，点击查看大图</td></tr>
@@ -6709,7 +6974,7 @@ class MainWindow(QMainWindow):
 <p style="color: #7f8c8d;">加密工程文件（.opj .dsn .sch .brd .dbk .dsnlck）无法预览，会显示提示信息而非二进制内容；请用对应 EDA 软件打开。</p>
 <p><b>预览开关（降低卡顿）：</b>菜单 <b>设置 → 预览设置</b> 可按类型分别开关自动预览（文本/PDF/图片/视频/压缩包/表格/文档）。关闭某类后，点击该类文件不会立即读取，预览区改为显示一个 <b>显示预览</b> 按钮，需手动点击才加载——适合大文件或慢速磁盘。各类开关会被记住。</p>
 
-<h3 style="color: #2980b9;">五、压缩包操作</h3>
+<h3 style="color: #2980b9;">六、压缩包操作</h3>
 <p><b>1. 智能解压</b></p>
 <p>右键压缩包选择“智能解压”，程序自动判断：</p>
 <ul>
@@ -6734,7 +6999,7 @@ class MainWindow(QMainWindow):
 <li>C:\\Program Files (x86)\\7-Zip\\7z.exe</li>
 </ol>
 
-<h3 style="color: #2980b9;">六、快捷访问栏</h3>
+<h3 style="color: #2980b9;">七、快捷访问栏</h3>
 <p>菜单栏下方的快捷访问栏提供常用文件夹的快速入口：</p>
 <ul>
 <li><b>普通按钮</b>（默认样式）：点击后在文件树中显示该文件夹内容</li>
@@ -6745,7 +7010,7 @@ class MainWindow(QMainWindow):
 <p>菜单 <b>设置 → 快捷访问设置</b> 可添加、删除、排序快捷项，并为每项设置名称、路径和是否不显示预览。</p>
 <p style="color: #7f8c8d;">提示：磁盘根目录、网络文件夹等大目录建议设为“不显示预览”，避免文件树加载缓慢。</p>
 
-<h3 style="color: #2980b9;">七、界面与导航</h3>
+<h3 style="color: #2980b9;">八、界面与导航</h3>
 <ul>
 <li><b>面包屑路径栏</b>：文件树上方显示从项目根到当前点选项的路径（如 <code>S1234 › V01 › BOM</code>）。单击任意目录段可在文件树中定位，双击任意目录段可直接用资源管理器打开该目录；路径过长时中间会自动省略。</li>
 <li><b>状态栏文件统计</b>：选中项目后，状态栏右侧常驻显示该项目递归的<b>文件数与总大小</b>，在后台计算不卡界面；切换项目会自动更新。</li>
@@ -6753,7 +7018,7 @@ class MainWindow(QMainWindow):
 <li><b>全屏已禁用</b>：本程序不支持全屏模式（避免菜单与关闭按钮不可见），按 F11 等不会进入全屏。</li>
 </ul>
 
-<h3 style="color: #2980b9;">八、视频预览与大图查看</h3>
+<h3 style="color: #2980b9;">九、视频预览与大图查看</h3>
 <p><b>1. 多帧视频预览</b></p>
 <p>视频预览默认<b>关闭</b>，需在 <b>设置 → 预览设置</b> 中手动开启(视频类)。开启后点击视频文件，会显示 5 张截图,分别对应视频 10%、30%、50%、70%、90% 位置。</p>
 <p><b>2. 视频帧查看器</b></p>
@@ -6766,14 +7031,14 @@ class MainWindow(QMainWindow):
 <li><b>拖拽</b>：左键按住拖动平移图片(图片大于视口时)</li>
 </ul>
 
-<h3 style="color: #2980b9;">九、新建项目与版本结构</h3>
+<h3 style="color: #2980b9;">十、新建项目与版本结构</h3>
 <p><b>1. 新建项目文件夹</b></p>
 <p>点击左侧 <b>新建项目文件夹</b>，选择类型（S/M）、输入编号和保存位置，程序自动创建符合命名规则的项目文件夹。可选注释会作为文件夹名后缀保存，便于后续识别。</p>
 <p><b>2. 新建文件夹内部结构</b></p>
 <p>选中一个项目后，点击 <b>新建文件夹内部结构</b>，可创建版本文件夹（如 <code>V01</code>）及标准子文件夹（BOM、SCH、物料、评审、信号测试），也可自定义子文件夹。上次选择的模板会被记住。</p>
 <p style="color: #7f8c8d;">建议同一项目内按版本目录归档资料，例如 <code>V01</code>、<code>V02</code>，减少不同阶段文件混放。</p>
 
-<h3 style="color: #2980b9;">十、快捷键</h3>
+<h3 style="color: #2980b9;">十一、快捷键</h3>
 <table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">
 <tr style="background: #ecf0f1;"><th>快捷键</th><th>功能</th></tr>
 <tr><td>F5</td><td>刷新项目列表和文件树</td></tr>
@@ -6785,7 +7050,7 @@ class MainWindow(QMainWindow):
 <tr><td>→ ↓</td><td>视频帧查看器:切换到下一帧</td></tr>
 </table>
 
-<h3 style="color: #2980b9;">十一、配置文件与数据保存</h3>
+<h3 style="color: #2980b9;">十二、配置文件与数据保存</h3>
 <ul>
 <li><b>应用设置</b>：项目路径、排序选项、快捷访问、7-Zip 路径、预览开关、窗口大小/位置/分栏、上次打开的项目等保存到 <code>seavoexplorer.json</code></li>
 <li><b>项目注释</b>：手动编辑的注释保存到 <code>seavo_comments.json</code></li>
@@ -6793,7 +7058,7 @@ class MainWindow(QMainWindow):
 <li><b>隐藏属性</b>：在 Windows 下配置文件会尽量设置为隐藏，避免误删</li>
 </ul>
 
-<h3 style="color: #2980b9;">十二、常见问题</h3>
+<h3 style="color: #2980b9;">十三、常见问题</h3>
 <ul>
 <li><b>找不到项目</b>：检查根目录是否添加正确、项目文件夹是否符合 S/M + 3~4 位数字规则；若项目在更深层目录，请勾选“包含子文件夹”</li>
 <li><b>列表顺序不符合预期</b>：检查是否启用了“按编号排序”；关闭后会按根目录添加顺序分组显示</li>
@@ -6802,7 +7067,7 @@ class MainWindow(QMainWindow):
 <li><b>不小心删除文件</b>：程序会移入系统回收站，可点击状态栏右侧回收站按钮打开并恢复</li>
 <li><b>预览内容乱码</b>：文本预览会尝试 UTF-8 / GBK；若仍乱码，请用专业编辑器或对应软件打开原文件</li>
 </ul>
-<h3 style="color: #2980b9;">十三、关于更新</h3>
+<h3 style="color: #2980b9;">十四、关于更新</h3>
 <p>如果你使用“帮助 → 检查更新”，程序会优先尝试在应用内下载更新；若网络较慢或下载失败，可直接打开 GitHub Releases 页面用浏览器下载。</p>
 '''
         )
@@ -6971,45 +7236,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(zoom_reset_btn)
         layout.addStretch()
         return layout
-
-    def _capture_video_frames(self, path, target_height=480):
-        """在 VIDEO_PREVIEW_POSITIONS 各时间点截图,返回等比缩放后的 QPixmap 列表。"""
-        if not HAS_OPENCV:
-            return None
-        frames = []
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            cap.release()
-            return None
-        try:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total_frames <= 0:
-                return None
-            for pos in VIDEO_PREVIEW_POSITIONS:
-                frame_no = max(0, min(int(total_frames * pos), total_frames - 1))
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = frame_rgb.shape
-                # 等比缩放到 target_height
-                scale = target_height / h
-                new_w = max(1, int(round(w * scale)))
-                resized = cv2.resize(frame_rgb, (new_w, target_height), interpolation=cv2.INTER_AREA)
-                q_img = QImage(resized.data, resized.shape[1], resized.shape[0], resized.shape[1] * ch, QImage.Format_RGB888).copy()
-                frames.append(QPixmap.fromImage(q_img))
-        finally:
-            try: cap.release()
-            except Exception: pass
-        return frames if frames else None
-    
-    def generate_video_thumbnails(self, video_path=None, thumb_h=96):
-        """在 VIDEO_PREVIEW_POSITIONS 各时间点截图,返回等比缩放后的 QPixmap 列表。
-        可传入 video_path,否则使用 self.current_video_path。"""
-        if video_path is None:
-            video_path = getattr(self, 'current_video_path', None)
-        return self._capture_video_frames(video_path, target_height=thumb_h)
 
     def generate_video_thumbnail(self, video_path, size=(320, 240)):
         """保留:单个视频缩略图(中点帧),向后兼容。"""

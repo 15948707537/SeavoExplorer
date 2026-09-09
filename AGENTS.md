@@ -16,9 +16,9 @@
 
 ## 项目概况
 
-SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以 S/M 编号命名的硬件/PCB 项目目录。界面、业务和平台集成集中在约 6,300 行的 `main.py`。
+SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以 S/M 编号命名的硬件/PCB 项目目录。界面、业务和平台集成集中在约 7,362 行的 `main.py`。
 
-- 当前版本为 0.5.4；运行时版本的首要来源是 `main.py` 的 `APP_VERSION`。
+- 当前版本为 0.6.0；运行时版本的首要来源是 `main.py` 的 `APP_VERSION`。
 - 源码保持 Python 3.8 grammar 兼容；官方 Windows EXE 已验证环境为 Python 3.13.2 x64。
 - UI、用户提示和主要文档使用中文，文本统一 UTF-8。
 - Windows 是实际目标平台，代码使用 `os.startfile`、Windows Shell/`ctypes`、强制回收站接口和固定的 7-Zip 安装位置。
@@ -29,7 +29,7 @@ SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以
 | 路径 | 职责与注意事项 |
 | --- | --- |
 | `main.py` | 应用入口和全部主要产品逻辑；运行行为的首要事实来源。 |
-| `test_safety.py` | 47 项产品安全/回归测试；会导入 PyQt5，但使用临时数据，不应接触真实项目。 |
+| `test_safety.py` | 81 项产品安全/回归测试；会导入 PyQt5，但使用临时数据，不应接触真实项目。 |
 | `test_tooling.py` | 23 项无网络辅助链路测试：版本、哈希、严格环境、manifest、快照、完整遍历、环境净化、tag/draft/assets。 |
 | `requirements.txt` | Python >=3.8 源码运行依赖范围，不含 PyInstaller。 |
 | `requirements-build.txt` | Python 3.13.2 x64 官方构建环境的精确版本锁；除 venv 自带 pip/wheel 外，正式构建拒绝锁外发行包。 |
@@ -76,7 +76,7 @@ SeavoExplorer 是 Windows PyQt5 桌面文件浏览器，用于发现和管理以
 
 扫描器要求捕获组 1 可转换为整数项目编号，并直接读取捕获组 2 作为注释。自定义规则修改必须覆盖该契约、编译失败回退、持久化和异步扫描快照。
 
-重要现状：`_is_regex_safe()` 虽然存在，但当前没有接入保存或解析链路；不要在文档、发布说明或回复中声称已经对任意自定义规则实现 ReDoS 防护。若任务要求补上安全校验，应同时添加捕获组/编号契约验证和测试。
+重要现状：`_is_regex_safe()` 已接入保存与解析链路，并在 0.6.0 升级为结构分析器，覆盖 `{m,n}` 量词、嵌套重复组和回溯引用；它仍是启发式防护，不能保证覆盖所有复杂正则，不要在文档、发布说明或回复中声称对任意自定义规则实现了完整 ReDoS 防护。
 
 ### 状态持久化
 
@@ -132,7 +132,7 @@ git diff --check
 git status --short
 ```
 
-当前 70 项测试中，47 项产品测试覆盖版本/裸 `except`、默认路径、终端、回收站、7-Zip 授权、手动预览、路径规范化、预览资源释放、外部剪贴板粘贴、面包屑双击、保存版本后缀递增、更新 `.part` 和事务式解压；23 项 tooling tests 覆盖构建/发布的 fail-closed 契约。它们不是完整 GUI/所有文件格式的端到端测试，报告时必须区分。
+当前 104 项测试中，81 项产品测试覆盖版本/裸 `except`、默认路径、终端、回收站、7-Zip 授权、手动预览、路径规范化、预览资源释放、外部剪贴板粘贴、面包屑双击、保存版本后缀递增、更新 `.part`、事务式解压、正则结构安全、文本编码/BOM、zip 去重、folder_structure 归一化、失效根目录错误信号、old/ 守卫和文档一致性；23 项 tooling tests 覆盖构建/发布的 fail-closed 契约。它们不是完整 GUI/所有文件格式的端到端测试，报告时必须区分。
 
 正式 onefile 验证必须使用由 `requirements-build.txt` 创建、未启用 system-site-packages，且除 venv 自带 pip/wheel 外无锁外包的 Python 3.13.2 x64 venv：
 
@@ -158,6 +158,7 @@ git status --short
 - 已发布 v0.5.1 EXE 为 96,926,112 bytes，SHA-256：`126134AF93E31344768B847760B25FFE56F24C966AC36EE5216003D51B661937`。
 - draft→三资产 digest 核验→publish 自动化已随 v0.5.1 完成首次真实 GitHub 端到端发布；三个远端资产均已核对 digest。
 - 新构建会写入 PE FileVersion/ProductVersion；这不等于 Authenticode 签名。当前没有签名证书。
-- 自定义正则安全检查尚未接入实际链路，是后续产品代码风险，不得通过修改文档掩盖。
+- 自定义正则安全检查已接入保存与解析链路，并在 0.6.0 升级为结构启发式；仍需注意它不能覆盖所有复杂正则。
+- v0.6.0 发布信息见 GitHub Release；发布后补充 tag、commit、EXE 大小与 SHA-256。
 
 交付时明确报告修改文件、实际执行的检查、构建产物哈希和未执行事项；不要把“语法可解析”表述成“GUI 功能已验证”。
