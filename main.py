@@ -418,7 +418,7 @@ def _is_regex_safe(pattern):
     except Exception:
         return False, 'regex structure is too complex to analyze safely'
 
-APP_VERSION = '0.6.1'
+APP_VERSION = '0.6.2'
 GITHUB_REPO_URL = 'https://github.com/FengBujue0104/SeavoExplorer/'
 GITHUB_RELEASES_URL = 'https://github.com/FengBujue0104/SeavoExplorer/releases'
 GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/FengBujue0104/SeavoExplorer/releases/latest'

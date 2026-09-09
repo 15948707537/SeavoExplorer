@@ -1,8 +1,8 @@
 # SeavoExplorer 主板项目文件浏览器
 
-**版本 0.6.1**
+**版本 0.6.2**
 
-Windows 单文件版可从 [v0.6.1 Release](https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.1) 下载。发布页同时提供独立 SHA-256 文件和 build manifest；下载后应核对附件中的哈希。
+Windows 单文件版可从 [v0.6.2 Release](https://github.com/FengBujue0104/SeavoExplorer/releases/tag/v0.6.2) 下载。发布页同时提供独立 SHA-256 文件和 build manifest；下载后应核对附件中的哈希。
 
 ---
 
